@@ -17,11 +17,6 @@
             background: rgba(0,255,0,0.2); border: 1px solid #0f0; color: #0f0;
             cursor: pointer; border-radius: 4px; font-family: monospace; font-size: 10px;
         }
-        #help {
-            position: fixed; bottom: 10px; right: 10px; z-index: 999;
-            color: #0f0; font-size: 8px; background: rgba(0,0,0,0.8);
-            padding: 5px 8px; border-radius: 3px; opacity: 0.6;
-        }
     </style>
 </head>
 <body>
@@ -31,13 +26,11 @@
         <div>AUDIO: <span id="audio">OFF</span> | P: <span id="count">0</span></div>
         <div style="font-size: 8px">B:<span id="bass">0</span> M:<span id="mid">0</span> H:<span id="high">0</span></div>
         <div style="font-size: 8px; color: #0ff">BPM:<span id="bpm">-</span> BEAT:<span id="phase">-</span></div>
-        <div style="font-size: 8px; color: #f0f">IMG:<span id="imagestate">-</span></div>
+        <div style="font-size: 8px; color: #f0f">IMG:<span id="imgst">-</span></div>
     </div>
     <button id="audioBtn">START AUDIO</button>
-    <div id="help">Up/Dn Sync | R Reset | I Image</div>
 
     <script>
-    // SINGLE CANVAS - no fx layer, no bloom, no chromatic = max FPS
     const canvas = document.getElementById('c');
     const ctx = canvas.getContext('2d', { alpha: false });
 
@@ -51,118 +44,119 @@
     window.addEventListener('resize', resize);
 
     // =========================================
-    // 2D PERLIN NOISE for flow field
+    // PRE-RENDERED GLOW SPRITE (created ONCE, reused for all particles)
     // =========================================
-    const P = new Uint8Array(512);
-    for (let i = 0; i < 256; i++) P[i] = i;
-    for (let i = 255; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [P[i], P[j]] = [P[j], P[i]]; }
-    for (let i = 0; i < 256; i++) P[i + 256] = P[i];
+    const GLOW_RES = 64;
+    const glowSprite = document.createElement('canvas');
+    glowSprite.width = glowSprite.height = GLOW_RES;
+    (function() {
+        const g = glowSprite.getContext('2d');
+        const c = GLOW_RES / 2;
+        const grad = g.createRadialGradient(c, c, 0, c, c, c);
+        grad.addColorStop(0, 'rgba(255,255,255,1)');
+        grad.addColorStop(0.3, 'rgba(255,255,255,0.5)');
+        grad.addColorStop(0.6, 'rgba(255,255,255,0.15)');
+        grad.addColorStop(1, 'rgba(255,255,255,0)');
+        g.fillStyle = grad;
+        g.fillRect(0, 0, GLOW_RES, GLOW_RES);
+    })();
+
+    // =========================================
+    // 2D PERLIN NOISE
+    // =========================================
+    const _P = new Uint8Array(512);
+    for (let i = 0; i < 256; i++) _P[i] = i;
+    for (let i = 255; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [_P[i], _P[j]] = [_P[j], _P[i]]; }
+    for (let i = 0; i < 256; i++) _P[i + 256] = _P[i];
 
     function perlin2d(x, y) {
         const xi = Math.floor(x) & 255, yi = Math.floor(y) & 255;
         const xf = x - Math.floor(x), yf = y - Math.floor(y);
         const u = xf * xf * xf * (xf * (xf * 6 - 15) + 10);
         const v = yf * yf * yf * (yf * (yf * 6 - 15) + 10);
-        const aa = P[P[xi] + yi], ab = P[P[xi] + yi + 1];
-        const ba = P[P[xi + 1] + yi], bb = P[P[xi + 1] + yi + 1];
-        const g = (hash, fx, fy) => {
-            const h = hash & 3;
-            return (h < 2 ? fx : -fx) + (h === 0 || h === 3 ? fy : -fy);
-        };
+        const g = (h, fx, fy) => ((h & 3) < 2 ? fx : -fx) + ((h & 3) === 0 || (h & 3) === 3 ? fy : -fy);
+        const aa = _P[_P[xi] + yi], ab = _P[_P[xi] + yi + 1];
+        const ba = _P[_P[xi + 1] + yi], bb = _P[_P[xi + 1] + yi + 1];
         return (1 - v) * ((1 - u) * g(aa, xf, yf) + u * g(ba, xf - 1, yf)) +
                v * ((1 - u) * g(ab, xf, yf - 1) + u * g(bb, xf - 1, yf - 1));
     }
 
     // =========================================
-    // AUDIO STATE
+    // AUDIO
     // =========================================
     const A = {
-        active: false, ctx: null, analyser: null,
-        data: null, len: 0,
+        on: false, ctx: null, an: null, data: null, len: 0,
         bass: 0, mid: 0, high: 0, energy: 0, beat: 0, onset: 0,
-        bpm: 0, beatPhase: 0, beatInterval: 0, beatConfidence: 0,
-        lastBeatTime: 0, nextBeatTime: 0, beatHistory: [],
-        energyHistory: [], lastData: null, spectralFlux: 0,
+        bpm: 0, phase: 0, interval: 0, confidence: 0,
+        lastBeat: 0, nextBeat: 0, hist: [],
+        eHist: [], lastData: null, flux: 0,
 
-        analyze() {
-            if (!this.active || !this.analyser) return;
-            this.analyser.getByteFrequencyData(this.data);
-
-            const nyquist = this.ctx.sampleRate / 2;
-            const bw = nyquist / this.len;
+        tick() {
+            if (!this.on) return;
+            this.an.getByteFrequencyData(this.data);
+            const ny = this.ctx.sampleRate / 2, bw = ny / this.len;
             let bs = 0, ms = 0, hs = 0, bc = 0, mc = 0, hc = 0;
-
             for (let i = 0; i < this.len; i++) {
                 const f = i * bw;
                 if (f < 250) { bs += this.data[i]; bc++; }
                 else if (f < 2000) { ms += this.data[i]; mc++; }
                 else { hs += this.data[i]; hc++; }
             }
-
             this.bass = (bs / bc / 255) || 0;
             this.mid = (ms / mc / 255) || 0;
             this.high = (hs / hc / 255) || 0;
 
-            let eSum = 0;
-            for (let i = 0; i < this.len; i++) eSum += this.data[i] * this.data[i];
-            this.energy = Math.sqrt(eSum / this.len) / 255;
+            let es = 0;
+            for (let i = 0; i < this.len; i++) es += this.data[i] * this.data[i];
+            this.energy = Math.sqrt(es / this.len) / 255;
 
-            this.energyHistory.push(this.energy);
-            if (this.energyHistory.length > 4) this.energyHistory.shift();
-            const avg = this.energyHistory.reduce((a, b) => a + b, 0) / this.energyHistory.length;
-
+            this.eHist.push(this.energy);
+            if (this.eHist.length > 4) this.eHist.shift();
+            const avg = this.eHist.reduce((a, b) => a + b, 0) / this.eHist.length;
             const diff = this.energy - avg;
             this.onset = diff > 0 ? diff * 5 : 0;
-            const thr = 1.15 - (this.beatConfidence * 0.1);
-            const beatHit = this.energy > avg * thr;
-            this.beat = beatHit ? diff * 8 : 0;
+            const thr = 1.15 - (this.confidence * 0.1);
+            const hit = this.energy > avg * thr;
+            this.beat = hit ? diff * 8 : 0;
 
             const now = this.ctx.currentTime;
-            if (beatHit && now - this.lastBeatTime > 0.2) {
-                this.beatHistory.push(now);
-                if (this.beatHistory.length > 8) this.beatHistory.shift();
-                this.lastBeatTime = now;
-                this._detectBPM();
+            if (hit && now - this.lastBeat > 0.2) {
+                this.hist.push(now);
+                if (this.hist.length > 8) this.hist.shift();
+                this.lastBeat = now;
+                this._bpm();
             }
 
-            // Spectral flux
             if (this.lastData) {
-                let flux = 0;
+                let fl = 0;
                 for (let i = 0; i < this.len; i++) {
                     const d = this.data[i] - this.lastData[i];
-                    if (d > 0) flux += d * d;
+                    if (d > 0) fl += d * d;
                 }
-                this.spectralFlux = Math.sqrt(flux / this.len) / 255;
-            } else {
-                this.lastData = new Uint8Array(this.len);
-            }
+                this.flux = Math.sqrt(fl / this.len) / 255;
+            } else { this.lastData = new Uint8Array(this.len); }
             this.lastData.set(this.data);
 
-            // Update beat phase
-            if (this.beatInterval > 0 && this.lastBeatTime > 0) {
-                this.beatPhase = ((now - this.lastBeatTime) / this.beatInterval) % 1;
-                this.nextBeatTime = this.lastBeatTime + this.beatInterval;
-                if (now > this.nextBeatTime) {
-                    this.lastBeatTime = this.nextBeatTime;
-                    this.nextBeatTime += this.beatInterval;
-                }
+            if (this.interval > 0 && this.lastBeat > 0) {
+                this.phase = ((now - this.lastBeat) / this.interval) % 1;
+                this.nextBeat = this.lastBeat + this.interval;
+                if (now > this.nextBeat) { this.lastBeat = this.nextBeat; this.nextBeat += this.interval; }
             }
         },
 
-        _detectBPM() {
-            if (this.beatHistory.length < 4) return;
-            const intervals = [];
-            for (let i = 1; i < this.beatHistory.length; i++)
-                intervals.push(this.beatHistory[i] - this.beatHistory[i - 1]);
-            const valid = intervals.filter(i => i > 0.3 && i < 2.0);
-            if (valid.length < 2) return;
-            const sorted = valid.slice().sort((a, b) => a - b);
-            const median = sorted[Math.floor(sorted.length / 2)];
-            const newBPM = 60 / median;
-            this.bpm = this.bpm === 0 ? newBPM : this.bpm * 0.85 + newBPM * 0.15;
-            this.beatInterval = 60 / this.bpm;
-            const variance = valid.reduce((s, i) => s + Math.abs(i - median), 0) / valid.length;
-            this.beatConfidence = Math.max(0, 1 - variance * 5);
+        _bpm() {
+            if (this.hist.length < 4) return;
+            const iv = [];
+            for (let i = 1; i < this.hist.length; i++) iv.push(this.hist[i] - this.hist[i - 1]);
+            const v = iv.filter(i => i > 0.3 && i < 2.0);
+            if (v.length < 2) return;
+            const s = v.slice().sort((a, b) => a - b);
+            const med = s[Math.floor(s.length / 2)];
+            const nb = 60 / med;
+            this.bpm = this.bpm === 0 ? nb : this.bpm * 0.85 + nb * 0.15;
+            this.interval = 60 / this.bpm;
+            const va = v.reduce((s, i) => s + Math.abs(i - med), 0) / v.length;
+            this.confidence = Math.max(0, 1 - va * 5);
         }
     };
 
@@ -170,316 +164,274 @@
     // IMAGE SYSTEM
     // =========================================
     const IMG = {
-        canvas: null, ctx: null,
-        W: 200, H: 150, // Small = fast processing
-        ready: false,
-        morphProgress: 0,
-        lastChangeTime: 0,
-        prefetched: null,
-        prefetchReady: false,
-        attractorCount: 0,
-        transitioning: false,
+        cv: null, cx: null, IW: 200, IH: 150,
+        ready: false, morph: 0, lastTime: 0,
+        pre: null, preReady: false, transitioning: false,
 
         init() {
-            this.canvas = document.createElement('canvas');
-            this.canvas.width = this.W;
-            this.canvas.height = this.H;
-            this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
+            this.cv = document.createElement('canvas');
+            this.cv.width = this.IW; this.cv.height = this.IH;
+            this.cx = this.cv.getContext('2d', { willReadFrequently: true });
         },
 
         fetch() {
             const img = new Image();
             img.crossOrigin = 'anonymous';
-            img.onload = () => { this.prefetched = img; this.prefetchReady = true; };
+            img.onload = () => { this.pre = img; this.preReady = true; };
             img.onerror = () => setTimeout(() => this.fetch(), 2000);
-            img.src = `https://picsum.photos/${this.W}/${this.H}?random=${Math.random()}`;
+            img.src = `https://picsum.photos/${this.IW}/${this.IH}?random=${Math.random()}`;
         },
 
         transition() {
-            if (!this.prefetchReady || !this.prefetched) return;
+            if (!this.preReady || !this.pre) return;
 
-            // Draw to processing canvas
-            this.ctx.drawImage(this.prefetched, 0, 0, this.W, this.H);
-            const data = this.ctx.getImageData(0, 0, this.W, this.H).data;
+            this.cx.drawImage(this.pre, 0, 0, this.IW, this.IH);
+            const data = this.cx.getImageData(0, 0, this.IW, this.IH).data;
+            this.pre = null; this.preReady = false;
 
-            this.prefetched = null;
-            this.prefetchReady = false;
+            // *** 2D GRID SAMPLING - evenly distributed across image ***
+            const cols = Math.ceil(Math.sqrt(N * (this.IW / this.IH)));
+            const rows = Math.ceil(N / cols);
+            const stepX = this.IW / cols;
+            const stepY = this.IH / rows;
 
-            // Sample ALL pixels evenly to match particle count
-            const totalPixels = this.W * this.H;
-            const step = Math.max(1, Math.floor(totalPixels / particles.length));
-            let pIdx = 0;
+            let idx = 0;
+            for (let row = 0; row < rows && idx < N; row++) {
+                for (let col = 0; col < cols && idx < N; col++) {
+                    const px = Math.floor(col * stepX + stepX * 0.5);
+                    const py = Math.floor(row * stepY + stepY * 0.5);
+                    const di = (py * this.IW + px) * 4;
 
-            for (let i = 0; i < totalPixels && pIdx < particles.length; i += step) {
-                const x = i % this.W;
-                const y = Math.floor(i / this.W);
-                const di = i * 4;
-
-                const p = particles[pIdx];
-                p.targetX = (x / this.W) * W;
-                p.targetY = (y / this.H) * H;
-                // INSTANT color - no slow interpolation!
-                p.imgR = data[di];
-                p.imgG = data[di + 1];
-                p.imgB = data[di + 2];
-                pIdx++;
-            }
-
-            // Fill remaining particles (if any)
-            while (pIdx < particles.length) {
-                const src = particles[pIdx % Math.max(1, pIdx - 1)];
-                const p = particles[pIdx];
-                p.targetX = src.targetX + (Math.random() - 0.5) * 10;
-                p.targetY = src.targetY + (Math.random() - 0.5) * 10;
-                p.imgR = src.imgR;
-                p.imgG = src.imgG;
-                p.imgB = src.imgB;
-                pIdx++;
-            }
-
-            this.attractorCount = particles.length;
-            this.ready = true;
-            this.morphProgress = 0;
-            this.lastChangeTime = performance.now();
-            this.transitioning = true;
-
-            // Prefetch next immediately
-            this.fetch();
-        },
-
-        update() {
-            const elapsed = performance.now() - this.lastChangeTime;
-
-            // First image
-            if (this.lastChangeTime === 0) {
-                this.fetch();
-                this.lastChangeTime = performance.now();
-                return;
-            }
-
-            // Change every 8-12 seconds, beat-synced if possible
-            const minTime = 8000, maxTime = 12000;
-            if (elapsed > maxTime && this.prefetchReady) {
-                this.transition();
-            } else if (elapsed > minTime && this.prefetchReady) {
-                if (A.beatConfidence > 0.5 && A.beatPhase < 0.08) {
-                    this.transition();
-                } else if (!A.active || A.beatConfidence <= 0.5) {
-                    this.transition();
+                    const p = particles[idx];
+                    p.tx = (px / this.IW) * W;
+                    p.ty = (py / this.IH) * H;
+                    p.cr = data[di];
+                    p.cg = data[di + 1];
+                    p.cb = data[di + 2];
+                    idx++;
                 }
             }
 
-            // Morph progress: 0 -> 1 over ~3 seconds
-            if (this.ready && this.morphProgress < 1) {
-                this.morphProgress = Math.min(1, this.morphProgress + 0.006);
+            // Shuffle assignment so particles don't always go to same spot
+            const assignments = [];
+            for (let i = 0; i < idx; i++) assignments.push({ tx: particles[i].tx, ty: particles[i].ty, cr: particles[i].cr, cg: particles[i].cg, cb: particles[i].cb });
+            // Fisher-Yates shuffle
+            for (let i = assignments.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [assignments[i], assignments[j]] = [assignments[j], assignments[i]];
+            }
+            for (let i = 0; i < N; i++) {
+                const a = assignments[i % assignments.length];
+                particles[i].tx = a.tx;
+                particles[i].ty = a.ty;
+                particles[i].cr = a.cr;
+                particles[i].cg = a.cg;
+                particles[i].cb = a.cb;
             }
 
-            // Transition ends after morph completes
-            if (this.transitioning && this.morphProgress > 0.8) {
-                this.transitioning = false;
+            this.ready = true;
+            this.morph = 0;
+            this.lastTime = performance.now();
+            this.transitioning = true;
+            this.fetch(); // prefetch next
+        },
+
+        update() {
+            const elapsed = performance.now() - this.lastTime;
+            if (this.lastTime === 0) { this.fetch(); this.lastTime = performance.now(); return; }
+
+            const min = 8000, max = 12000;
+            if (elapsed > max && this.preReady) {
+                this.transition();
+            } else if (elapsed > min && this.preReady) {
+                if (A.confidence > 0.5 && A.phase < 0.08) this.transition();
+                else if (!A.on || A.confidence <= 0.5) this.transition();
             }
+
+            if (this.ready && this.morph < 1) this.morph = Math.min(1, this.morph + 0.008);
+            if (this.transitioning && this.morph > 0.7) this.transitioning = false;
         }
     };
 
     // =========================================
-    // PARTICLE
+    // PARTICLES
     // =========================================
-    const PARTICLE_COUNT = 500;
+    const N = 500;
     const particles = [];
 
-    class Particle {
-        constructor(i) {
-            const angle = (i / PARTICLE_COUNT) * Math.PI * 2;
-            const r = 100 + Math.random() * 200;
-            this.x = CX + Math.cos(angle) * r;
-            this.y = CY + Math.sin(angle) * r;
-            this.vx = 0;
-            this.vy = 0;
-            this.id = i;
-
-            // Image target
-            this.targetX = this.x;
-            this.targetY = this.y;
-            this.imgR = 128;
-            this.imgG = 128;
-            this.imgB = 128;
-        }
+    for (let i = 0; i < N; i++) {
+        const angle = (i / N) * Math.PI * 2;
+        const r = 80 + Math.random() * 250;
+        particles.push({
+            x: CX + Math.cos(angle) * r,
+            y: CY + Math.sin(angle) * r,
+            vx: 0, vy: 0, id: i,
+            tx: CX, ty: CY,
+            cr: 128, cg: 128, cb: 128
+        });
     }
-
-    for (let i = 0; i < PARTICLE_COUNT; i++) particles.push(new Particle(i));
-
-    // =========================================
-    // FLOW FIELD STATE
-    // =========================================
-    let flowTime = 0;
-    const FLOW_SCALE = 0.004;
-    const FLOW_Z = Math.random() * 1000;
 
     // =========================================
     // MAIN LOOP
     // =========================================
-    let t = 0, lastTime = performance.now(), fps = 60;
+    let t = 0, lastTime = performance.now(), fps = 60, flowT = 0;
+    const FS = 0.003; // flow scale
+    const FZ = Math.random() * 1000;
 
     IMG.init();
 
     function loop() {
         const now = performance.now();
-        const dt = now - lastTime;
-        fps = fps * 0.9 + (1000 / dt) * 0.1; // Smoothed FPS
+        fps = fps * 0.9 + (1000 / (now - lastTime)) * 0.1;
         lastTime = now;
         t += 0.016;
+        flowT += 0.006;
 
-        // Audio analysis
-        A.analyze();
-
-        // Image system update
+        A.tick();
         IMG.update();
 
-        flowTime += 0.008;
+        const imgS = IMG.ready ? Math.min(1, IMG.morph * 3) : 0; // ramp to 1 faster
 
-        // How much we're in "image mode"
-        const imgStrength = IMG.ready ? Math.min(1, IMG.morphProgress * 2.5) : 0;
-        // 0 -> free mode, 1 -> fully locked to image
-
-        // ---- CLEAR ----
-        // Stronger clear during image formation for crisp shapes
-        const clearAlpha = imgStrength > 0.3 ? 0.25 : 0.08;
-        ctx.fillStyle = `rgba(0,0,0,${clearAlpha})`;
+        // ---- CLEAR with trails ----
+        ctx.fillStyle = imgS > 0.5 ? 'rgba(0,0,0,0.18)' : 'rgba(0,0,0,0.06)';
         ctx.fillRect(0, 0, W, H);
 
-        // ---- UPDATE & DRAW PARTICLES ----
-        for (let i = 0; i < particles.length; i++) {
+        // ---- PARTICLES ----
+        // Use additive blending for glow
+        ctx.globalCompositeOperation = 'lighter';
+
+        for (let i = 0; i < N; i++) {
             const p = particles[i];
 
-            if (imgStrength > 0.1) {
-                // === IMAGE MODE ===
-                // Smooth lerp toward target - STRONG pull
-                const lerpStrength = 0.12 * imgStrength;
-                p.x += (p.targetX - p.x) * lerpStrength;
-                p.y += (p.targetY - p.y) * lerpStrength;
+            if (imgS > 0.1) {
+                // === IMAGE MODE: smooth lerp to target ===
+                const lerp = 0.12 * imgS;
+                p.x += (p.tx - p.x) * lerp;
+                p.y += (p.ty - p.y) * lerp;
+                p.vx *= 0.6;
+                p.vy *= 0.6;
 
-                // Kill velocity during formation
-                p.vx *= 0.7;
-                p.vy *= 0.7;
-
-                // Audio-reactive micro-movement (WITHIN the shape)
-                if (imgStrength > 0.5) {
-                    // Mid = vibration
-                    p.x += (Math.random() - 0.5) * A.mid * 2.5;
-                    p.y += (Math.random() - 0.5) * A.mid * 2.5;
-
-                    // High = scatter
+                // Audio micro-movement within shape
+                if (imgS > 0.4) {
+                    p.x += (Math.random() - 0.5) * A.mid * 3;
+                    p.y += (Math.random() - 0.5) * A.mid * 3;
                     if (A.high > 0.2) {
-                        p.x += (Math.random() - 0.5) * A.high * 4;
-                        p.y += (Math.random() - 0.5) * A.high * 4;
+                        p.x += (Math.random() - 0.5) * A.high * 5;
+                        p.y += (Math.random() - 0.5) * A.high * 5;
                     }
-
-                    // Beat = small burst
                     if (A.beat > 0.3) {
                         const ba = Math.random() * 6.28;
-                        p.vx += Math.cos(ba) * A.beat * 2;
-                        p.vy += Math.sin(ba) * A.beat * 2;
+                        p.vx += Math.cos(ba) * A.beat * 2.5;
+                        p.vy += Math.sin(ba) * A.beat * 2.5;
                     }
                 }
 
-                // Flow field during transitions
+                // Flow field during transition
                 if (IMG.transitioning) {
-                    const n = perlin2d(p.x * FLOW_SCALE + flowTime, p.y * FLOW_SCALE + FLOW_Z);
-                    const fAngle = n * 12.56; // 4*PI
-                    const amp = 1.5 * (1 + A.bass * 2) * (1 - imgStrength);
-                    p.vx += Math.cos(fAngle) * amp;
-                    p.vy += Math.sin(fAngle) * amp;
+                    const n = perlin2d(p.x * FS + flowT, p.y * FS + FZ);
+                    const amp = 2 * (1 + A.bass * 3) * (1 - imgS);
+                    p.vx += Math.cos(n * 12.56) * amp;
+                    p.vy += Math.sin(n * 12.56) * amp;
                 }
-
             } else {
-                // === FREE MODE ===
-                // Flow field always active in free mode
-                const n = perlin2d(p.x * FLOW_SCALE + flowTime, p.y * FLOW_SCALE + FLOW_Z);
-                const fAngle = n * 12.56;
-                const amp = 1.5 + A.bass * 4;
-                p.vx += Math.cos(fAngle) * amp * 0.15;
-                p.vy += Math.sin(fAngle) * amp * 0.15;
+                // === FREE MODE: flow field + audio ===
+                const n = perlin2d(p.x * FS + flowT, p.y * FS + FZ);
+                p.vx += Math.cos(n * 12.56) * (0.3 + A.bass * 0.8);
+                p.vy += Math.sin(n * 12.56) * (0.3 + A.bass * 0.8);
 
-                // Center gravity
+                // Gentle center pull
                 const dx = CX - p.x, dy = CY - p.y;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                if (dist > 50) {
-                    p.vx += (dx / dist) * 0.15;
-                    p.vy += (dy / dist) * 0.15;
-                }
+                const d = Math.sqrt(dx * dx + dy * dy);
+                if (d > 50) { p.vx += (dx / d) * 0.12; p.vy += (dy / d) * 0.12; }
 
-                // Audio energy
                 if (A.beat > 0.2) {
                     const ba = Math.random() * 6.28;
-                    p.vx += Math.cos(ba) * A.beat * 8;
-                    p.vy += Math.sin(ba) * A.beat * 8;
+                    p.vx += Math.cos(ba) * A.beat * 6;
+                    p.vy += Math.sin(ba) * A.beat * 6;
                 }
             }
 
             // Physics
-            p.vx *= 0.92;
-            p.vy *= 0.92;
+            p.vx *= 0.93; p.vy *= 0.93;
             const spd = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
             if (spd > 12) { p.vx = (p.vx / spd) * 12; p.vy = (p.vy / spd) * 12; }
-            p.x += p.vx;
-            p.y += p.vy;
-
-            // Wrap
-            if (p.x < -10) p.x = W + 10;
-            if (p.x > W + 10) p.x = -10;
-            if (p.y < -10) p.y = H + 10;
-            if (p.y > H + 10) p.y = -10;
+            p.x += p.vx; p.y += p.vy;
+            if (p.x < -20) p.x = W + 20; if (p.x > W + 20) p.x = -20;
+            if (p.y < -20) p.y = H + 20; if (p.y > H + 20) p.y = -20;
 
             // ---- DRAW ----
-            // Bass = size pulse
-            const basePulse = 1 + A.bass * 0.8;
-            const beatFlash = A.beat > 0.25 ? 50 : 0;
+            const pulse = 1 + A.bass * 1.2;
+            const flash = A.beat > 0.25 ? 0.4 : 0;
 
-            if (imgStrength > 0.3) {
-                // IMAGE MODE: Direct pixel color, simple fillRect (FASTEST)
-                const size = (3 + basePulse) * (0.5 + imgStrength * 0.5);
+            if (imgS > 0.3) {
+                // IMAGE MODE: colored glow circle using pre-rendered sprite
+                const sz = (5 + pulse * 2) * (0.6 + imgS * 0.4);
+                const drawSz = sz * 2;
 
-                ctx.fillStyle = `rgb(${Math.min(255, p.imgR + beatFlash)},${Math.min(255, p.imgG + beatFlash)},${Math.min(255, p.imgB + beatFlash)})`;
-                ctx.fillRect(p.x - size, p.y - size, size * 2, size * 2);
-            } else {
-                // FREE MODE: Simple circle, genome-ish colors, NO gradient
-                const hue = (t * 20 + p.id * 0.7 + A.bass * 100) % 360;
-                const sat = 70 + A.energy * 30;
-                const light = 40 + A.energy * 20 + beatFlash * 0.3;
-                const size = 2 + basePulse + A.onset * 1.5;
+                // Tint: draw colored base circle
+                const r = Math.min(255, p.cr + flash * 100) | 0;
+                const g = Math.min(255, p.cg + flash * 100) | 0;
+                const b = Math.min(255, p.cb + flash * 100) | 0;
 
-                ctx.fillStyle = `hsl(${hue},${sat}%,${light}%)`;
+                // Glow layer (white sprite tinted by additive blending)
+                ctx.globalAlpha = 0.4 + imgS * 0.3;
+                ctx.drawImage(glowSprite, p.x - drawSz, p.y - drawSz, drawSz * 2, drawSz * 2);
+
+                // Core colored circle
+                ctx.globalAlpha = 0.85;
+                ctx.fillStyle = `rgb(${r},${g},${b})`;
                 ctx.beginPath();
-                ctx.arc(p.x, p.y, size, 0, 6.28);
+                ctx.arc(p.x, p.y, sz * 0.6, 0, 6.28);
+                ctx.fill();
+            } else {
+                // FREE MODE: colorful glow particles
+                const hue = (t * 25 + p.id * 0.8 + A.bass * 80) % 360;
+                const sat = 70 + A.energy * 30;
+                const lum = 45 + A.energy * 20 + flash * 60;
+                const sz = 3 + pulse + A.onset * 2;
+
+                // Glow
+                ctx.globalAlpha = 0.35;
+                ctx.drawImage(glowSprite, p.x - sz * 2, p.y - sz * 2, sz * 4, sz * 4);
+
+                // Core
+                ctx.globalAlpha = 0.9;
+                ctx.fillStyle = `hsl(${hue},${sat}%,${lum}%)`;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, sz * 0.5, 0, 6.28);
                 ctx.fill();
             }
         }
 
-        // Beat indicator (simple, cheap)
-        if (A.beatPhase > 0 && A.beatConfidence > 0.5) {
-            const ringSize = 30 + A.beatPhase * 80;
-            const ringAlpha = (1 - A.beatPhase) * 0.5;
-            ctx.strokeStyle = `rgba(255,255,255,${ringAlpha})`;
+        // Reset composite
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 1;
+
+        // Beat ring
+        if (A.phase > 0 && A.confidence > 0.5) {
+            const rs = 30 + A.phase * 80;
+            const ra = (1 - A.phase) * 0.5;
+            ctx.strokeStyle = `rgba(255,255,255,${ra})`;
             ctx.lineWidth = 2;
             ctx.beginPath();
-            ctx.arc(CX, CY, ringSize, 0, 6.28);
+            ctx.arc(CX, CY, rs, 0, 6.28);
             ctx.stroke();
         }
 
         // ---- UI ----
         document.getElementById('fps').textContent = Math.round(fps);
-        document.getElementById('mode').textContent = imgStrength > 0.3 ? 'IMAGE' : 'FREE';
-        document.getElementById('audio').textContent = A.active ? 'ON' : 'OFF';
-        document.getElementById('count').textContent = PARTICLE_COUNT;
+        document.getElementById('mode').textContent = imgS > 0.3 ? 'IMAGE' : 'FLOW';
+        document.getElementById('audio').textContent = A.on ? 'ON' : 'OFF';
+        document.getElementById('count').textContent = N;
         document.getElementById('bass').textContent = A.bass.toFixed(2);
         document.getElementById('mid').textContent = A.mid.toFixed(2);
         document.getElementById('high').textContent = A.high.toFixed(2);
         document.getElementById('bpm').textContent = A.bpm > 0 ?
-            A.bpm.toFixed(0) + (A.beatConfidence > 0.7 ? 'ok' : '?') : '-';
-        document.getElementById('phase').textContent = A.beatPhase > 0 ?
-            (A.beatPhase * 100).toFixed(0) + '%' : '-';
-        document.getElementById('imagestate').textContent = IMG.ready ?
-            `${IMG.attractorCount}p ${(IMG.morphProgress * 100).toFixed(0)}%` : 'SCAN';
+            A.bpm.toFixed(0) + (A.confidence > 0.7 ? 'ok' : '?') : '-';
+        document.getElementById('phase').textContent = A.phase > 0 ?
+            (A.phase * 100).toFixed(0) + '%' : '-';
+        document.getElementById('imgst').textContent = IMG.ready ?
+            `${(IMG.morph * 100).toFixed(0)}%` : 'SCAN';
 
         requestAnimationFrame(loop);
     }
@@ -492,8 +444,7 @@
     document.getElementById('audioBtn').addEventListener('click', async () => {
         try {
             let stream;
-            const choice = confirm('Capturer ONGLET avec audio?\n\nOUI = Onglet (YouTube/Spotify)\nNON = Microphone');
-
+            const choice = confirm('Capturer ONGLET avec audio?\n\nOUI = Onglet\nNON = Microphone');
             if (choice && navigator.mediaDevices.getDisplayMedia) {
                 stream = await navigator.mediaDevices.getDisplayMedia({
                     video: true,
@@ -504,53 +455,36 @@
                     audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000 }
                 });
             }
-
             A.ctx = new (window.AudioContext || window.webkitAudioContext)();
-            A.analyser = A.ctx.createAnalyser();
-            A.analyser.fftSize = 512;
-            A.analyser.smoothingTimeConstant = 0.1;
-            A.ctx.createMediaStreamSource(stream).connect(A.analyser);
-            A.len = A.analyser.frequencyBinCount;
+            A.an = A.ctx.createAnalyser();
+            A.an.fftSize = 512;
+            A.an.smoothingTimeConstant = 0.1;
+            A.ctx.createMediaStreamSource(stream).connect(A.an);
+            A.len = A.an.frequencyBinCount;
             A.data = new Uint8Array(A.len);
-            A.active = true;
-
+            A.on = true;
             document.getElementById('audioBtn').textContent = 'AUDIO ON';
             document.getElementById('audioBtn').style.background = 'rgba(0,255,0,0.5)';
         } catch (err) {
-            console.error('Audio error:', err);
             alert('Erreur audio: autorisez micro ou partagez onglet.');
         }
     });
 
-    // Mouse click = explosion
     canvas.addEventListener('click', (e) => {
-        for (let i = 0; i < particles.length; i++) {
+        for (let i = 0; i < N; i++) {
             const p = particles[i];
             const dx = e.clientX - p.x, dy = e.clientY - p.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist < 300 && dist > 0) {
-                p.vx += (dx / dist) * 6;
-                p.vy += (dy / dist) * 6;
-            }
+            const d = Math.sqrt(dx * dx + dy * dy);
+            if (d < 300 && d > 0) { p.vx += (dx / d) * 6; p.vy += (dy / d) * 6; }
         }
     });
 
-    // Keyboard
     window.addEventListener('keydown', (e) => {
         if (e.key === 'i' || e.key === 'I') {
-            IMG.prefetchReady = false;
-            IMG.fetch();
-            const iv = setInterval(() => {
-                if (IMG.prefetchReady) { clearInterval(iv); IMG.transition(); }
-            }, 100);
+            IMG.preReady = false; IMG.fetch();
+            const iv = setInterval(() => { if (IMG.preReady) { clearInterval(iv); IMG.transition(); } }, 100);
         } else if (e.key === 'r' || e.key === 'R') {
-            // Scatter all particles
-            particles.forEach(p => {
-                p.x = Math.random() * W;
-                p.y = Math.random() * H;
-                p.vx = (Math.random() - 0.5) * 10;
-                p.vy = (Math.random() - 0.5) * 10;
-            });
+            particles.forEach(p => { p.x = Math.random() * W; p.y = Math.random() * H; p.vx = (Math.random() - 0.5) * 10; p.vy = (Math.random() - 0.5) * 10; });
         }
     });
     </script>
