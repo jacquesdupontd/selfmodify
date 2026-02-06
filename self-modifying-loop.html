@@ -33,11 +33,11 @@
         <div>FPS: <span id="fps">60</span> | MODE: <span id="mode">INIT</span></div>
         <div>AUDIO: <span id="audio">OFF</span> | AGENTS: <span id="count">0</span></div>
         <div style="font-size: 8px">B:<span id="bass">0</span> M:<span id="mid">0</span> H:<span id="high">0</span> P:<span id="pitch">-</span></div>
-        <div style="font-size: 8px; color: #0ff">BPM:<span id="bpm">-</span> 🎯:<span id="phase">-</span> ⚡:<span id="latency">35</span>ms</div>
-        <div style="font-size: 8px; color: #f0f">🧬:<span id="colormode">MULTI</span> 🖼️:<span id="imagestate">-</span></div>
+        <div style="font-size: 8px; color: #0ff">BPM:<span id="bpm">-</span> BEAT:<span id="phase">-</span> LAT:<span id="latency">35</span>ms</div>
+        <div style="font-size: 8px; color: #f0f">CLR:<span id="colormode">MULTI</span> IMG:<span id="imagestate">-</span></div>
     </div>
-    <button id="audioBtn">START AUDIO ⚡</button>
-    <div id="help">⬆⬇ Sync | R Reset | F Form | M Color | PROCEDURAL GEOMETRY ⚡</div>
+    <button id="audioBtn">START AUDIO</button>
+    <div id="help">Up/Dn Sync | R Reset | I Image | M Color | S Shape</div>
 
     <script>
         const baseCanvas = document.getElementById('base');
@@ -54,7 +54,163 @@
         resize();
         window.addEventListener('resize', resize);
 
+        // =============================================
+        // PRE-RENDERED SPRITE SYSTEM (8x faster than arc+gradient)
+        // =============================================
+        const spriteCache = {};
+        function getSprite(size, r, g, b, alpha) {
+            // Quantize to reduce cache entries
+            const qs = Math.round(size * 2) / 2;
+            const qr = (r >> 3) << 3;
+            const qg = (g >> 3) << 3;
+            const qb = (b >> 3) << 3;
+            const qa = Math.round(alpha * 10) / 10;
+            const key = `${qs}_${qr}_${qg}_${qb}_${qa}`;
+
+            if (spriteCache[key]) return spriteCache[key];
+
+            const d = Math.ceil(qs * 2 + 2);
+            const c = document.createElement('canvas');
+            c.width = c.height = d;
+            const sctx = c.getContext('2d');
+            const cx = d / 2, cy = d / 2;
+
+            // Glow gradient
+            const grad = sctx.createRadialGradient(cx, cy, 0, cx, cy, qs);
+            grad.addColorStop(0, `rgba(${Math.min(255, qr + 60)}, ${Math.min(255, qg + 60)}, ${Math.min(255, qb + 60)}, ${qa})`);
+            grad.addColorStop(0.4, `rgba(${qr}, ${qg}, ${qb}, ${qa * 0.7})`);
+            grad.addColorStop(1, `rgba(${qr}, ${qg}, ${qb}, 0)`);
+            sctx.fillStyle = grad;
+            sctx.fillRect(0, 0, d, d);
+
+            // Limit cache size
+            const keys = Object.keys(spriteCache);
+            if (keys.length > 500) {
+                for (let i = 0; i < 100; i++) delete spriteCache[keys[i]];
+            }
+
+            spriteCache[key] = c;
+            return c;
+        }
+
+        // Solid sprite for image mode (crisp, no glow)
+        const solidSpriteCache = {};
+        function getSolidSprite(size, r, g, b) {
+            const qs = Math.round(size * 2) / 2;
+            const qr = (r >> 2) << 2;
+            const qg = (g >> 2) << 2;
+            const qb = (b >> 2) << 2;
+            const key = `${qs}_${qr}_${qg}_${qb}`;
+
+            if (solidSpriteCache[key]) return solidSpriteCache[key];
+
+            const d = Math.ceil(qs * 2 + 2);
+            const c = document.createElement('canvas');
+            c.width = c.height = d;
+            const sctx = c.getContext('2d');
+            const cx = d / 2, cy = d / 2;
+
+            sctx.fillStyle = `rgb(${qr},${qg},${qb})`;
+            sctx.beginPath();
+            sctx.arc(cx, cy, qs, 0, Math.PI * 2);
+            sctx.fill();
+
+            // Bright core
+            sctx.fillStyle = `rgba(${Math.min(255, qr + 80)}, ${Math.min(255, qg + 80)}, ${Math.min(255, qb + 80)}, 0.6)`;
+            sctx.beginPath();
+            sctx.arc(cx, cy, qs * 0.35, 0, Math.PI * 2);
+            sctx.fill();
+
+            const skeys = Object.keys(solidSpriteCache);
+            if (skeys.length > 500) {
+                for (let i = 0; i < 100; i++) delete solidSpriteCache[skeys[i]];
+            }
+
+            solidSpriteCache[key] = c;
+            return c;
+        }
+
+        // =============================================
+        // 2D PERLIN NOISE (for flow field between images)
+        // =============================================
+        const permutation = [];
+        for (let i = 0; i < 256; i++) permutation[i] = i;
+        for (let i = 255; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [permutation[i], permutation[j]] = [permutation[j], permutation[i]];
+        }
+        const perm = [...permutation, ...permutation];
+
+        function fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+        function lerp(a, b, t) { return a + t * (b - a); }
+        function grad2d(hash, x, y) {
+            const h = hash & 3;
+            const u = h < 2 ? x : -x;
+            const v = h === 0 || h === 3 ? y : -y;
+            return u + v;
+        }
+
+        function perlin2d(x, y) {
+            const X = Math.floor(x) & 255;
+            const Y = Math.floor(y) & 255;
+            const xf = x - Math.floor(x);
+            const yf = y - Math.floor(y);
+            const u = fade(xf);
+            const v = fade(yf);
+            const aa = perm[perm[X] + Y];
+            const ab = perm[perm[X] + Y + 1];
+            const ba = perm[perm[X + 1] + Y];
+            const bb = perm[perm[X + 1] + Y + 1];
+            return lerp(
+                lerp(grad2d(aa, xf, yf), grad2d(ba, xf - 1, yf), u),
+                lerp(grad2d(ab, xf, yf - 1), grad2d(bb, xf - 1, yf - 1), u),
+                v
+            );
+        }
+
+        // 1D Perlin for genome evolution
+        function perlin(x, octaves = 4) {
+            let value = 0, amplitude = 1, frequency = 1, maxValue = 0;
+            for (let i = 0; i < octaves; i++) {
+                const sampleX = x * frequency;
+                value += (Math.sin(sampleX) * 0.5 + Math.cos(sampleX * 1.3) * 0.5) * amplitude;
+                maxValue += amplitude;
+                amplitude *= 0.5;
+                frequency *= 2;
+            }
+            return value / maxValue;
+        }
+
+        // Simple hash noise
+        function noise(x, y, seed = 0) {
+            const n = Math.sin(x * 12.9898 + y * 78.233 + seed * 45.164) * 43758.5453123;
+            return n - Math.floor(n);
+        }
+
+        // HSL to RGB conversion
+        function hslToRgb(h, s, l) {
+            h /= 360; s /= 100; l /= 100;
+            if (s === 0) { const v = Math.round(l * 255); return [v, v, v]; }
+            const hue2rgb = (p, q, t) => {
+                if (t < 0) t += 1;
+                if (t > 1) t -= 1;
+                if (t < 1/6) return p + (q - p) * 6 * t;
+                if (t < 1/2) return q;
+                if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+                return p;
+            };
+            const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+            const p = 2 * l - q;
+            return [
+                Math.round(hue2rgb(p, q, h + 1/3) * 255),
+                Math.round(hue2rgb(p, q, h) * 255),
+                Math.round(hue2rgb(p, q, h - 1/3) * 255)
+            ];
+        }
+
+        // =============================================
         // UNIVERSE STATE
+        // =============================================
         const U = {
             t: 0, fps: 60, lastTime: performance.now(),
             hue: 0, mode: 'calm', modeTimer: 0, intensity: 0.5,
@@ -67,21 +223,21 @@
             pitch: 0, pitchConfidence: 0,
             energyHistory: [], lastDataArray: null,
 
-            // 🎯 DUAL-CLOCK SYNC ENGINE
-            audioTime: 0,              // Precise audio clock (seconds)
-            visualTime: 0,             // Visual render time (seconds)
-            latencyCompensation: 0.035, // 35ms lookahead (tunable 20-50ms)
-            syncOffset: 0,             // Dynamic calibration offset
+            // DUAL-CLOCK SYNC ENGINE
+            audioTime: 0,
+            visualTime: 0,
+            latencyCompensation: 0.035,
+            syncOffset: 0,
 
-            // 🎵 BPM DETECTION & PHASE-LOCKED LOOP
-            bpm: 0,                    // Detected tempo
-            beatPhase: 0,              // 0-1 position in beat cycle
-            beatInterval: 0,           // Seconds between beats
-            lastBeatTime: 0,           // Audio time of last beat
-            nextBeatTime: 0,           // Predicted next beat
-            beatHistory: [],           // Timestamps for BPM analysis
-            beatConfidence: 0,         // How sure we are of tempo
-            scheduledEvents: [],       // Future events queue
+            // BPM DETECTION & PHASE-LOCKED LOOP
+            bpm: 0,
+            beatPhase: 0,
+            beatInterval: 0,
+            lastBeatTime: 0,
+            nextBeatTime: 0,
+            beatHistory: [],
+            beatConfidence: 0,
+            scheduledEvents: [],
 
             // Effects
             chromatic: 0, bloom: 0, distortion: 0,
@@ -90,43 +246,53 @@
             attractors: [],
             zones: [],
 
-            // 🧬 ORGANIC COLOR GENOME
+            // ORGANIC COLOR GENOME
             colorGenome: {
-                hueGene: Math.random() * 360,          // Base hue drift
-                hueDrift: (Math.random() - 0.5) * 2,   // Drift speed
-                saturationGene: 0.9,                   // 0-1 saturation (HIGH for vibrant!)
+                hueGene: Math.random() * 360,
+                hueDrift: (Math.random() - 0.5) * 2,
+                saturationGene: 0.9,
                 saturationDrift: 0,
-                lightnessGene: 0.5,                     // 0-1 brightness
+                lightnessGene: 0.5,
                 lightnessDrift: 0,
-                harmonyMode: 'multi',                   // mono/duo/triad/multi/bw
-                chromaticStress: 0,                     // 0=BW, 1=saturated
-                mutationRate: 0.001,                    // Probability of sudden change
-                noiseOffset: Math.random() * 1000,      // Perlin noise seed
-                evolution: 0                             // Evolution time counter
+                harmonyMode: 'multi',
+                chromaticStress: 0,
+                mutationRate: 0.001,
+                noiseOffset: Math.random() * 1000,
+                evolution: 0
             },
 
-            // 🎨 PROCEDURAL FORMS SYSTEM - Geometric shapes that morph!
-            formSystem: {
-                currentForm: null,                      // Current form name
-                formAttractors: [],                     // Target positions for particles
-                morphProgress: 0,                       // Morph animation progress (0-1)
-                lastChangeTime: 0,                      // Last form change timestamp
-                changeDuration: 5000,                   // Change every 5 seconds
-                formReady: false,
+            // IMAGE REALITY FEED
+            imageSystem: {
+                currentImage: null,
+                nextImage: null,
+                imageCanvas: null,
+                imageCtx: null,
+                imageAttractors: [],
+                morphProgress: 0,
+                lastFetchTime: 0,
+                imageReady: false,
+                imageWidth: 0,
+                imageHeight: 0,
+                shapeMode: 'filled',
+                modeChangeCounter: 0,
+                // Transition state
+                transitioning: false,
+                transitionProgress: 0,
+                oldAttractors: [],
+                // Timing
+                imageInterval: 10000, // 10 seconds base
+                prefetchedImage: null,
+                prefetchReady: false,
+                beatsSinceChange: 0
+            },
 
-                // Form parameters (randomized each change)
-                centerX: 0,
-                centerY: 0,
-                rotation: 0,
-                scale: 1,
-                audioMod: 0,
-
-                // Color palette for current form
-                palette: {
-                    hue: 0,
-                    satRange: [60, 100],
-                    lightRange: [40, 70]
-                }
+            // FLOW FIELD state
+            flowField: {
+                active: false,
+                time: 0,
+                scale: 0.003,
+                strength: 2,
+                noiseZ: Math.random() * 1000
             },
 
             updateEntropy() {
@@ -136,11 +302,9 @@
 
             updateMode() {
                 this.modeTimer++;
-
-                // 🎵 BEAT-LOCKED MODE CHANGES: Only switch on downbeat when music is playing
                 const canChange = this.beatConfidence > 0.5 ?
-                    (this.beatPhase < 0.1 && Math.random() < 0.3) : // On beat
-                    (Math.random() < 0.01 || this.modeTimer > 120 + Math.random() * 100); // Random
+                    (this.beatPhase < 0.1 && Math.random() < 0.3) :
+                    (Math.random() < 0.01 || this.modeTimer > 120 + Math.random() * 100);
 
                 if (canChange) {
                     this.modeTimer = 0;
@@ -152,119 +316,82 @@
                 if (Math.random() < 0.015) this.intensity = Math.random() * 2.5;
             },
 
-            // 🎯 DUAL-CLOCK: Update audio time with DYNAMIC latency compensation
+            // DUAL-CLOCK
             updateAudioClock() {
                 if (!this.audioActive || !this.audioContext) {
                     this.audioTime = this.visualTime;
                     return;
                 }
-
-                // Audio clock is THE truth - visual follows with compensation
                 this.audioTime = this.audioContext.currentTime;
-
-                // 🆕 DYNAMIC LATENCY: Measure browser's actual output latency
                 const browserLatency = this.audioContext.outputLatency || 0;
-                const totalCompensation = browserLatency + this.syncOffset;
-
-                // Visual time runs ahead to compensate for processing lag
-                this.visualTime = this.audioTime + totalCompensation;
+                this.visualTime = this.audioTime + browserLatency + this.syncOffset;
             },
 
-            // 🎵 BPM DETECTION: Analyze beat intervals
+            // BPM DETECTION
             detectBPM() {
                 if (this.beatHistory.length < 4) return;
-
-                // Calculate intervals between recent beats
                 const intervals = [];
                 for (let i = 1; i < this.beatHistory.length; i++) {
                     intervals.push(this.beatHistory[i] - this.beatHistory[i - 1]);
                 }
-
-                // Filter outliers (remove intervals outside 300-2000ms / 30-200 BPM)
                 const validIntervals = intervals.filter(i => i > 0.3 && i < 2.0);
                 if (validIntervals.length < 2) return;
-
-                // Calculate median interval (robust against false beats)
                 const sorted = validIntervals.slice().sort((a, b) => a - b);
                 const median = sorted[Math.floor(sorted.length / 2)];
-
-                // Smooth BPM changes
                 const newBPM = 60 / median;
                 this.bpm = this.bpm === 0 ? newBPM : this.bpm * 0.85 + newBPM * 0.15;
                 this.beatInterval = 60 / this.bpm;
-
-                // Calculate confidence based on consistency
                 const variance = validIntervals.reduce((sum, i) => sum + Math.abs(i - median), 0) / validIntervals.length;
                 this.beatConfidence = Math.max(0, 1 - variance * 5);
             },
 
-            // 🎵 PHASE-LOCKED LOOP: Predict next beat
+            // PHASE-LOCKED LOOP
             updateBeatPhase() {
                 if (this.beatInterval === 0 || this.lastBeatTime === 0) return;
-
-                // Calculate phase (0-1) within current beat cycle
                 const timeSinceLastBeat = this.audioTime - this.lastBeatTime;
                 this.beatPhase = (timeSinceLastBeat / this.beatInterval) % 1;
-
-                // Predict next beat time
                 this.nextBeatTime = this.lastBeatTime + this.beatInterval;
-
-                // If we're past predicted beat, advance to next cycle
                 if (this.audioTime > this.nextBeatTime) {
                     this.lastBeatTime = this.nextBeatTime;
                     this.nextBeatTime += this.beatInterval;
                 }
             },
 
-            // 🚀 SCHEDULE EVENT: Queue visual event at precise audio time
             scheduleEvent(eventTime, callback, data = {}) {
                 this.scheduledEvents.push({ time: eventTime, callback, data });
-                // Sort by time (earliest first)
                 this.scheduledEvents.sort((a, b) => a.time - b.time);
             },
 
-            // ⚡ PROCESS SCHEDULED EVENTS: Trigger when visual time catches up
             processScheduledEvents() {
                 while (this.scheduledEvents.length > 0) {
                     const event = this.scheduledEvents[0];
-
-                    // If visual time has reached event time, trigger it
                     if (this.visualTime >= event.time) {
                         event.callback(event.data);
                         this.scheduledEvents.shift();
                     } else {
-                        break; // Future events wait
+                        break;
                     }
                 }
             },
 
-            // 🧬 EVOLVE COLOR GENOME: Organic color consciousness
+            // EVOLVE COLOR GENOME
             evolveColorGenome() {
                 const g = this.colorGenome;
                 g.evolution += 0.016;
 
-                // Multi-scale Perlin drift (slow organic evolution)
                 const slowNoise = perlin((g.evolution + g.noiseOffset) * 0.02, 3);
                 const mediumNoise = perlin((g.evolution + g.noiseOffset) * 0.1, 2);
                 const fastNoise = perlin((g.evolution + g.noiseOffset) * 0.5, 2);
 
-                // Hue drift (continuous evolution)
                 g.hueDrift += slowNoise * 0.5;
                 g.hueGene = (g.hueGene + g.hueDrift + mediumNoise * 2) % 360;
-
-                // Saturation breathing (KEEP IT HIGH for vibrant colors!)
                 g.saturationDrift += mediumNoise * 0.01;
-                g.saturationGene = Math.max(0.6, Math.min(1, g.saturationGene + g.saturationDrift * 0.1)); // Min 60%!
-
-                // Lightness oscillation
+                g.saturationGene = Math.max(0.6, Math.min(1, g.saturationGene + g.saturationDrift * 0.1));
                 g.lightnessDrift += fastNoise * 0.008;
                 g.lightnessGene = Math.max(0.2, Math.min(0.8, g.lightnessGene + g.lightnessDrift * 0.05));
-
-                // Chromatic stress evolution (BW ↔ Color tension)
                 g.chromaticStress += mediumNoise * 0.02;
                 g.chromaticStress = Math.max(0, Math.min(1, g.chromaticStress));
 
-                // 🔥 MUTATIONS: Sudden phase flips
                 if (Math.random() < g.mutationRate || (this.beat > 0.3 && Math.random() < 0.05)) {
                     const mutations = [
                         () => { g.harmonyMode = ['mono', 'duo', 'triad', 'multi', 'bw'][Math.floor(Math.random() * 5)]; },
@@ -276,369 +403,238 @@
                     mutations[Math.floor(Math.random() * mutations.length)]();
                 }
 
-                // Audio-reactive DNA damage
-                if (this.onset > 0.3) {
-                    g.chromaticStress = Math.min(1, g.chromaticStress + this.onset * 0.5);
-                }
-                if (this.bass > 0.7) {
-                    g.lightnessGene = Math.max(0.2, g.lightnessGene - this.bass * 0.1);
-                }
+                if (this.onset > 0.3) g.chromaticStress = Math.min(1, g.chromaticStress + this.onset * 0.5);
+                if (this.bass > 0.7) g.lightnessGene = Math.max(0.2, g.lightnessGene - this.bass * 0.1);
             },
 
-            // 🎨 GET COLOR FROM GENOME: Generate colors based on evolved DNA
             getColorFromGenome(variation = 0, energyMod = 1) {
                 const g = this.colorGenome;
                 let h, s, l;
-
                 switch(g.harmonyMode) {
-                    case 'mono':
-                        h = g.hueGene;
-                        s = g.saturationGene * 100;
-                        l = (g.lightnessGene + variation * 0.1) * 100;
-                        break;
-
-                    case 'duo':
-                        h = variation > 0 ? g.hueGene : (g.hueGene + 180) % 360;
-                        s = g.saturationGene * 100;
-                        l = g.lightnessGene * 100;
-                        break;
-
-                    case 'triad':
-                        const triadShift = Math.floor(variation * 3) * 120;
-                        h = (g.hueGene + triadShift) % 360;
-                        s = g.saturationGene * 100;
-                        l = g.lightnessGene * 100;
-                        break;
-
-                    case 'bw':
-                        h = 0;
-                        s = 0;
-                        l = (g.lightnessGene + variation * 0.2) * 100;
-                        break;
-
-                    case 'multi':
-                    default:
-                        h = (g.hueGene + variation * 50) % 360;
-                        s = (g.saturationGene * 0.7 + 0.3) * 100;
-                        l = g.lightnessGene * 100;
-                        break;
+                    case 'mono': h = g.hueGene; s = g.saturationGene * 100; l = (g.lightnessGene + variation * 0.1) * 100; break;
+                    case 'duo': h = variation > 0 ? g.hueGene : (g.hueGene + 180) % 360; s = g.saturationGene * 100; l = g.lightnessGene * 100; break;
+                    case 'triad': { const ts = Math.floor(variation * 3) * 120; h = (g.hueGene + ts) % 360; s = g.saturationGene * 100; l = g.lightnessGene * 100; break; }
+                    case 'bw': h = 0; s = 0; l = (g.lightnessGene + variation * 0.2) * 100; break;
+                    default: h = (g.hueGene + variation * 50) % 360; s = (g.saturationGene * 0.7 + 0.3) * 100; l = g.lightnessGene * 100; break;
                 }
-
-                // Apply chromatic stress (desaturate when stress low)
                 s = s * g.chromaticStress;
-
-                // Energy modulation
                 l = Math.max(20, Math.min(80, l + energyMod * 15));
-
                 return { h, s, l };
             },
 
-            // 🎨 FORM GENERATORS - Create geometric patterns
-            generateSpiral(count) {
-                const points = [];
-                const turns = 3 + Math.random() * 2; // 3-5 turns
-                for (let i = 0; i < count; i++) {
-                    const t = (i / count) * turns * Math.PI * 2;
-                    const r = (i / count) * 300 * this.formSystem.scale;
-                    points.push({
-                        x: this.formSystem.centerX + Math.cos(t + this.formSystem.rotation) * r,
-                        y: this.formSystem.centerY + Math.sin(t + this.formSystem.rotation) * r
-                    });
-                }
-                return points;
+            // =============================================
+            // IMAGE SYSTEM
+            // =============================================
+            initImageSystem() {
+                const img = this.imageSystem;
+                img.imageCanvas = document.createElement('canvas');
+                img.imageCtx = img.imageCanvas.getContext('2d', { willReadFrequently: true });
+                img.imageCanvas.width = 320;
+                img.imageCanvas.height = 240;
+                img.imageWidth = 320;
+                img.imageHeight = 240;
             },
 
-            generateGrid(count) {
-                const points = [];
-                const gridSize = Math.ceil(Math.sqrt(count));
-                const spacing = 600 * this.formSystem.scale / gridSize;
-                for (let i = 0; i < count; i++) {
-                    const row = Math.floor(i / gridSize);
-                    const col = i % gridSize;
-                    const x = col * spacing - (gridSize * spacing) / 2;
-                    const y = row * spacing - (gridSize * spacing) / 2;
-                    // Rotate
-                    const rx = x * Math.cos(this.formSystem.rotation) - y * Math.sin(this.formSystem.rotation);
-                    const ry = x * Math.sin(this.formSystem.rotation) + y * Math.cos(this.formSystem.rotation);
-                    points.push({
-                        x: this.formSystem.centerX + rx,
-                        y: this.formSystem.centerY + ry
-                    });
-                }
-                return points;
-            },
+            async fetchRandomImage() {
+                const img = this.imageSystem;
+                try {
+                    const url = `https://picsum.photos/320/240?random=${Math.random()}`;
+                    const image = new Image();
+                    image.crossOrigin = 'anonymous';
 
-            generateCircles(count) {
-                const points = [];
-                const rings = 5 + Math.floor(Math.random() * 3); // 5-7 rings
-                for (let i = 0; i < count; i++) {
-                    const ring = Math.floor((i / count) * rings);
-                    const angleStep = (Math.PI * 2) / Math.max(1, Math.floor(count / rings));
-                    const angle = (i % Math.floor(count / rings)) * angleStep + this.formSystem.rotation;
-                    const radius = ((ring + 1) / rings) * 350 * this.formSystem.scale;
-                    points.push({
-                        x: this.formSystem.centerX + Math.cos(angle) * radius,
-                        y: this.formSystem.centerY + Math.sin(angle) * radius
-                    });
-                }
-                return points;
-            },
-
-            generateWave(count) {
-                const points = [];
-                const waves = 3;
-                const width = 800 * this.formSystem.scale;
-                const height = 200 * this.formSystem.scale;
-                for (let i = 0; i < count; i++) {
-                    const x = (i / count) * width - width / 2;
-                    const y = Math.sin((i / count) * Math.PI * 2 * waves + this.formSystem.rotation) * height;
-                    // Rotate around center
-                    const rx = x * Math.cos(this.formSystem.rotation) - y * Math.sin(this.formSystem.rotation);
-                    const ry = x * Math.sin(this.formSystem.rotation) + y * Math.cos(this.formSystem.rotation);
-                    points.push({
-                        x: this.formSystem.centerX + rx,
-                        y: this.formSystem.centerY + ry
-                    });
-                }
-                return points;
-            },
-
-            generateStar(count) {
-                const points = [];
-                const spikes = 5 + Math.floor(Math.random() * 3); // 5-7 spikes
-                const outerRadius = 300 * this.formSystem.scale;
-                const innerRadius = 150 * this.formSystem.scale;
-                for (let i = 0; i < count; i++) {
-                    const angle = (i / count) * Math.PI * 2 + this.formSystem.rotation;
-                    const spike = Math.floor((angle / (Math.PI * 2)) * spikes * 2);
-                    const radius = spike % 2 === 0 ? outerRadius : innerRadius;
-                    points.push({
-                        x: this.formSystem.centerX + Math.cos(angle) * radius,
-                        y: this.formSystem.centerY + Math.sin(angle) * radius
-                    });
-                }
-                return points;
-            },
-
-            generateDNA(count) {
-                const points = [];
-                const height = 600 * this.formSystem.scale;
-                const radius = 100 * this.formSystem.scale;
-                for (let i = 0; i < count; i++) {
-                    const t = (i / count) * Math.PI * 4; // 2 full rotations
-                    const y = (i / count) * height - height / 2;
-                    const strand = i % 2; // Alternate strands
-                    const x = Math.cos(t + strand * Math.PI) * radius;
-                    // Rotate
-                    const rx = x * Math.cos(this.formSystem.rotation) - y * Math.sin(this.formSystem.rotation);
-                    const ry = x * Math.sin(this.formSystem.rotation) + y * Math.cos(this.formSystem.rotation);
-                    points.push({
-                        x: this.formSystem.centerX + rx,
-                        y: this.formSystem.centerY + ry
-                    });
-                }
-                return points;
-            },
-
-            generatePolygon(count) {
-                const points = [];
-                const sides = 3 + Math.floor(Math.random() * 5); // 3-7 sides
-                const radius = 300 * this.formSystem.scale;
-                const pointsPerSide = Math.floor(count / sides);
-                for (let i = 0; i < count; i++) {
-                    const side = Math.floor(i / pointsPerSide);
-                    const t = (i % pointsPerSide) / pointsPerSide;
-                    const angle1 = (side / sides) * Math.PI * 2 + this.formSystem.rotation;
-                    const angle2 = ((side + 1) / sides) * Math.PI * 2 + this.formSystem.rotation;
-                    const x = (Math.cos(angle1) * (1 - t) + Math.cos(angle2) * t) * radius;
-                    const y = (Math.sin(angle1) * (1 - t) + Math.sin(angle2) * t) * radius;
-                    points.push({
-                        x: this.formSystem.centerX + x,
-                        y: this.formSystem.centerY + y
-                    });
-                }
-                return points;
-            },
-
-            generateGalaxy(count) {
-                const points = [];
-                const arms = 3;
-                for (let i = 0; i < count; i++) {
-                    const arm = i % arms;
-                    const t = (i / count) * Math.PI * 4;
-                    const r = (i / count) * 350 * this.formSystem.scale;
-                    const angle = t + (arm * Math.PI * 2 / arms) + this.formSystem.rotation;
-                    const scatter = (Math.random() - 0.5) * 30;
-                    points.push({
-                        x: this.formSystem.centerX + Math.cos(angle) * r + scatter,
-                        y: this.formSystem.centerY + Math.sin(angle) * r + scatter
-                    });
-                }
-                return points;
-            },
-
-            // 🎨 SELECT RANDOM FORM & GENERATE
-            selectRandomForm() {
-                const form = this.formSystem;
-
-                // 🎨 RANDOM FORM SELECTION
-                const forms = ['spiral', 'grid', 'circles', 'wave', 'star', 'dna', 'polygon', 'galaxy'];
-                form.currentForm = forms[Math.floor(Math.random() * forms.length)];
-
-                // 🎲 RANDOMIZE PARAMETERS
-                form.centerX = CX + (Math.random() - 0.5) * 300; // Off-center!
-                form.centerY = CY + (Math.random() - 0.5) * 300;
-                form.rotation = Math.random() * Math.PI * 2;
-                form.scale = 0.6 + Math.random() * 0.6; // 0.6-1.2
-
-                // 🌈 FORM-SPECIFIC COLOR PALETTES
-                const palettes = {
-                    spiral: { hue: 280, satRange: [70, 95], lightRange: [45, 75] },      // Purple/violet
-                    grid: { hue: 120, satRange: [60, 90], lightRange: [40, 70] },        // Green
-                    circles: { hue: 200, satRange: [65, 95], lightRange: [50, 80] },     // Cyan/blue
-                    wave: { hue: 180, satRange: [70, 100], lightRange: [45, 75] },       // Aqua
-                    star: { hue: 40, satRange: [75, 100], lightRange: [55, 85] },        // Gold/yellow
-                    dna: { hue: 330, satRange: [65, 90], lightRange: [50, 75] },         // Pink/magenta
-                    polygon: { hue: 20, satRange: [70, 95], lightRange: [50, 80] },      // Orange/red
-                    galaxy: { hue: 260, satRange: [60, 85], lightRange: [35, 65] }       // Deep purple
-                };
-
-                form.palette = palettes[form.currentForm];
-
-                // Generate target positions
-                this.generateFormPositions();
-
-                form.formReady = true;
-                form.morphProgress = 0;
-                form.lastChangeTime = performance.now();
-
-                console.log(`🎨 Form: ${form.currentForm.toUpperCase()} | Center: (${form.centerX.toFixed(0)}, ${form.centerY.toFixed(0)}) | Rotation: ${(form.rotation * 180 / Math.PI).toFixed(0)}°`);
-            },
-
-            // 🎯 GENERATE FORM POSITIONS & ASSIGN TO PARTICLES
-            generateFormPositions() {
-                const form = this.formSystem;
-
-                // 🎯 CALL APPROPRIATE GENERATOR based on form type
-                let positions = [];
-                switch(form.currentForm) {
-                    case 'spiral': positions = this.generateSpiral(agents.length); break;
-                    case 'grid': positions = this.generateGrid(agents.length); break;
-                    case 'circles': positions = this.generateCircles(agents.length); break;
-                    case 'wave': positions = this.generateWave(agents.length); break;
-                    case 'star': positions = this.generateStar(agents.length); break;
-                    case 'dna': positions = this.generateDNA(agents.length); break;
-                    case 'polygon': positions = this.generatePolygon(agents.length); break;
-                    case 'galaxy': positions = this.generateGalaxy(agents.length); break;
-                }
-
-                // Convert positions to attractors
-                form.formAttractors = positions.map((pos, i) => {
-                    // Generate color based on form palette
-                    const palette = form.palette;
-                    const hueVariation = (Math.random() - 0.5) * 30; // ±15° variation
-                    const saturation = palette.satRange[0] + Math.random() * (palette.satRange[1] - palette.satRange[0]);
-                    const lightness = palette.lightRange[0] + Math.random() * (palette.lightRange[1] - palette.lightRange[0]);
-
-                    return {
-                        x: pos.x,
-                        y: pos.y,
-                        color: {
-                            h: (palette.hue + hueVariation + 360) % 360,
-                            s: saturation,
-                            l: lightness
-                        }
+                    image.onload = () => {
+                        // Store as prefetch - don't apply yet
+                        img.prefetchedImage = image;
+                        img.prefetchReady = true;
                     };
-                });
 
-                // 🎯 ASSIGN particles to target positions (1:1 mapping)
-                agents.forEach((agent, i) => {
-                    const attractor = form.formAttractors[i % form.formAttractors.length];
-                    agent.assignedAttractor = attractor;
-                    agent.imageColorHint = attractor.color; // Use form color!
-                });
+                    image.onerror = () => {
+                        console.log('Image load failed - retrying...');
+                        setTimeout(() => this.fetchRandomImage(), 2000);
+                    };
 
-                console.log(`✨ Generated ${form.formAttractors.length} targets for ${form.currentForm}`);
+                    image.src = url;
+                } catch (error) {
+                    console.log('Image fetch error:', error);
+                }
             },
 
-            // 🔍 SOBEL EDGE DETECTION
-            sobelEdgeDetection(pixels, width, height) {
-                const edges = new Uint8Array(width * height);
+            // Start transition to prefetched image
+            startImageTransition() {
+                const img = this.imageSystem;
+                if (!img.prefetchReady || !img.prefetchedImage) return;
 
-                // Sobel kernels
-                const sobelX = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
-                const sobelY = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+                // Save old attractors for crossfade
+                img.oldAttractors = img.imageAttractors.slice();
+                img.transitioning = true;
+                img.transitionProgress = 0;
 
-                for (let y = 1; y < height - 1; y++) {
-                    for (let x = 1; x < width - 1; x++) {
-                        let gx = 0, gy = 0;
+                // Apply the prefetched image
+                img.currentImage = img.prefetchedImage;
+                img.prefetchedImage = null;
+                img.prefetchReady = false;
 
-                        // Apply kernels
-                        for (let ky = -1; ky <= 1; ky++) {
-                            for (let kx = -1; kx <= 1; kx++) {
-                                const idx = ((y + ky) * width + (x + kx)) * 4;
-                                const gray = (pixels[idx] + pixels[idx + 1] + pixels[idx + 2]) / 3;
-                                const kernelIdx = (ky + 1) * 3 + (kx + 1);
+                // Process the new image
+                this.processImage();
 
-                                gx += gray * sobelX[kernelIdx];
-                                gy += gray * sobelY[kernelIdx];
+                // Immediately prefetch next image
+                this.fetchRandomImage();
+
+                img.lastFetchTime = performance.now();
+                img.beatsSinceChange = 0;
+
+                // Cycle shape mode
+                img.modeChangeCounter++;
+                if (img.modeChangeCounter % 3 === 0) img.shapeMode = 'filled';
+                else if (img.modeChangeCounter % 3 === 1) img.shapeMode = 'lines';
+                else img.shapeMode = 'hybrid';
+            },
+
+            // PROCESS IMAGE: Extract pixel colors + assign targets
+            processImage() {
+                const img = this.imageSystem;
+                if (!img.currentImage) return;
+
+                img.imageCtx.drawImage(img.currentImage, 0, 0, img.imageWidth, img.imageHeight);
+                const imageData = img.imageCtx.getImageData(0, 0, img.imageWidth, img.imageHeight);
+                const pixels = imageData.data;
+
+                img.imageAttractors = [];
+
+                // Sample pixels based on shape mode
+                const sampledPixels = [];
+
+                for (let y = 1; y < img.imageHeight - 1; y += 2) {
+                    for (let x = 1; x < img.imageWidth - 1; x += 2) {
+                        const idx = (y * img.imageWidth + x) * 4;
+                        const r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2];
+                        const brightness = (r + g + b) / 3;
+
+                        if (img.shapeMode === 'filled' || img.shapeMode === 'hybrid') {
+                            if (brightness < 140) {
+                                sampledPixels.push({ x, y, r, g, b, brightness, type: 'interior' });
                             }
                         }
 
-                        const magnitude = Math.sqrt(gx * gx + gy * gy);
-                        edges[y * width + x] = Math.min(255, magnitude);
+                        if (img.shapeMode === 'lines' || img.shapeMode === 'hybrid') {
+                            const right = ((y * img.imageWidth + (x + 1)) * 4);
+                            const down = (((y + 1) * img.imageWidth + x) * 4);
+                            const rightBr = (pixels[right] + pixels[right + 1] + pixels[right + 2]) / 3;
+                            const downBr = (pixels[down] + pixels[down + 1] + pixels[down + 2]) / 3;
+                            const gradient = Math.abs(brightness - rightBr) + Math.abs(brightness - downBr);
+                            if (gradient > 25) {
+                                sampledPixels.push({ x, y, r, g, b, brightness, type: 'edge' });
+                            }
+                        }
                     }
                 }
 
-                return edges;
-            },
+                // If too few dark pixels, sample ALL pixels (bright images like sky/snow)
+                if (sampledPixels.length < agents.length / 2) {
+                    for (let y = 0; y < img.imageHeight; y += 3) {
+                        for (let x = 0; x < img.imageWidth; x += 3) {
+                            const idx = (y * img.imageWidth + x) * 4;
+                            sampledPixels.push({
+                                x, y,
+                                r: pixels[idx], g: pixels[idx + 1], b: pixels[idx + 2],
+                                brightness: (pixels[idx] + pixels[idx + 1] + pixels[idx + 2]) / 3,
+                                type: 'all'
+                            });
+                        }
+                    }
+                }
 
-            // 🎨 EXTRACT DOMINANT COLORS (simplified K-means)
-            extractDominantColors(pixels, k = 5) {
-                const colors = [];
-                const sampleSize = 1000;
+                // Subsample to match particle count
+                const targetCount = Math.min(agents.length, sampledPixels.length);
+                const sampleRate = Math.max(1, Math.floor(sampledPixels.length / targetCount));
 
-                // Sample random pixels
-                for (let i = 0; i < sampleSize; i++) {
-                    const idx = Math.floor(Math.random() * (pixels.length / 4)) * 4;
-                    colors.push({
-                        r: pixels[idx],
-                        g: pixels[idx + 1],
-                        b: pixels[idx + 2]
+                for (let i = 0; i < sampledPixels.length && img.imageAttractors.length < targetCount; i += sampleRate) {
+                    const p = sampledPixels[i];
+                    const screenX = (p.x / img.imageWidth) * W;
+                    const screenY = (p.y / img.imageHeight) * H;
+
+                    img.imageAttractors.push({
+                        x: screenX,
+                        y: screenY,
+                        r: p.r, g: p.g, b: p.b,
+                        strength: 1,
+                        type: p.type
                     });
                 }
 
-                // Simple clustering (just take spread samples for now)
-                const clusters = [];
-                for (let i = 0; i < k; i++) {
-                    const sample = colors[Math.floor((i / k) * colors.length)];
-                    clusters.push(sample);
-                }
+                // Shuffle & assign particles 1:1
+                const shuffled = [...img.imageAttractors].sort(() => Math.random() - 0.5);
+                agents.forEach((agent, i) => {
+                    const attractor = shuffled[i % shuffled.length];
+                    agent.targetX = attractor.x;
+                    agent.targetY = attractor.y;
+                    agent.targetR = attractor.r;
+                    agent.targetG = attractor.g;
+                    agent.targetB = attractor.b;
+                });
 
-                return clusters;
+                img.imageReady = true;
+                img.morphProgress = 0;
             },
 
-            // 🌊 UPDATE FORM SYSTEM (5 SECOND CHANGES!)
-            updateFormSystem() {
-                const form = this.formSystem;
+            // UPDATE IMAGE SYSTEM - smart timing
+            updateImageSystem() {
+                const img = this.imageSystem;
 
-                // ⏰ Change form every 5 seconds
-                const timeSinceLastChange = performance.now() - form.lastChangeTime;
-                if (timeSinceLastChange > form.changeDuration || form.lastChangeTime === 0) {
-                    this.selectRandomForm();
+                const timeSinceLastFetch = performance.now() - img.lastFetchTime;
+
+                // Prefetch first image immediately
+                if (img.lastFetchTime === 0) {
+                    this.fetchRandomImage();
+                    img.lastFetchTime = performance.now();
+                    return;
                 }
 
-                // Smooth morph animation
-                if (form.formReady && form.morphProgress < 1) {
-                    form.morphProgress = Math.min(1, form.morphProgress + 0.02); // Smooth transition
+                // When prefetch is ready and enough time has passed: transition
+                const minTime = 8000; // 8 sec minimum
+                const maxTime = 12000; // 12 sec maximum
+
+                let shouldChange = false;
+
+                if (timeSinceLastFetch > maxTime && img.prefetchReady) {
+                    shouldChange = true;
+                } else if (timeSinceLastFetch > minTime && img.prefetchReady) {
+                    // Try to sync with beat
+                    if (this.beatConfidence > 0.5 && this.beatPhase < 0.08) {
+                        shouldChange = true;
+                    } else if (this.beatConfidence <= 0.5) {
+                        shouldChange = true;
+                    }
+                }
+
+                if (shouldChange) {
+                    this.startImageTransition();
+                }
+
+                // Transition animation
+                if (img.transitioning) {
+                    img.transitionProgress += 0.02;
+                    if (img.transitionProgress >= 1) {
+                        img.transitioning = false;
+                        img.transitionProgress = 1;
+                    }
+                }
+
+                // Morph progress
+                if (img.imageReady && img.morphProgress < 1) {
+                    img.morphProgress = Math.min(1, img.morphProgress + 0.012);
+                }
+
+                // Flow field between transitions
+                this.flowField.active = img.transitioning || img.morphProgress < 0.3;
+                if (this.flowField.active) {
+                    this.flowField.time += 0.01;
                 }
             },
 
             updateAttractors() {
-                // Spawn attractors
                 const spawnRate = this.audioActive ? 0.03 + this.beat * 0.1 : 0.02;
                 if (Math.random() < spawnRate && this.attractors.length < 8) {
-                    const type = Math.random() < 0.3 ? 'strange' : 'normal';
                     this.attractors.push({
                         x: CX + (Math.random() - 0.5) * W * 0.8,
                         y: CY + (Math.random() - 0.5) * H * 0.8,
@@ -647,7 +643,7 @@
                         strength: (Math.random() - 0.5) * 3,
                         life: 100 + Math.random() * 300,
                         radius: 80 + Math.random() * 150,
-                        type: type,
+                        type: Math.random() < 0.3 ? 'strange' : 'normal',
                         phase: Math.random() * Math.PI * 2
                     });
                 }
@@ -656,44 +652,32 @@
                     a.life--;
                     a.x += a.vx + (Math.random() - 0.5) * (1 + this.high * 3);
                     a.y += a.vy + (Math.random() - 0.5) * (1 + this.high * 3);
-
                     if (a.type === 'strange') {
                         a.phase += 0.05;
                         a.x += Math.sin(a.phase) * 2;
                         a.y += Math.cos(a.phase) * 2;
                     }
-
                     return a.life > 0;
                 });
 
-                // Energy zones
                 if (Math.random() < 0.01 && this.zones.length < 3) {
                     this.zones.push({
-                        x: Math.random() * W,
-                        y: Math.random() * H,
+                        x: Math.random() * W, y: Math.random() * H,
                         radius: 100 + Math.random() * 200,
                         strength: (Math.random() - 0.5) * 2,
-                        life: 200,
-                        hot: Math.random() < 0.5
+                        life: 200, hot: Math.random() < 0.5
                     });
                 }
-
-                this.zones = this.zones.filter(z => {
-                    z.life--;
-                    z.radius += (Math.random() - 0.5) * 5;
-                    return z.life > 0;
-                });
+                this.zones = this.zones.filter(z => { z.life--; z.radius += (Math.random() - 0.5) * 5; return z.life > 0; });
             },
 
             analyzeAudio() {
                 if (!this.audioActive || !this.analyser) return;
 
                 this.analyser.getByteFrequencyData(this.dataArray);
-
                 const nyquist = this.audioContext.sampleRate / 2;
                 const binWidth = nyquist / this.bufferLength;
 
-                // Frequency bands
                 let bassSum = 0, midSum = 0, highSum = 0;
                 let bassCount = 0, midCount = 0, highCount = 0;
 
@@ -708,50 +692,39 @@
                 this.mid = (midSum / midCount / 255) || 0;
                 this.high = (highSum / highCount / 255) || 0;
 
-                // Energy
                 let energySum = 0;
                 for (let i = 0; i < this.bufferLength; i++) {
                     energySum += this.dataArray[i] * this.dataArray[i];
                 }
                 this.energy = Math.sqrt(energySum / this.bufferLength) / 255;
 
-                // Beat/onset detection (OPTIMIZED - shorter history for less lag)
                 this.energyHistory.push(this.energy);
-                if (this.energyHistory.length > 4) this.energyHistory.shift(); // Reduced from 8 to 4 frames
+                if (this.energyHistory.length > 4) this.energyHistory.shift();
                 const avgEnergy = this.energyHistory.reduce((a, b) => a + b, 0) / this.energyHistory.length;
 
                 const energyDiff = this.energy - avgEnergy;
                 this.onset = energyDiff > 0 ? energyDiff * 5 : 0;
 
-                // Adaptive beat threshold
-                const threshold = 1.15 - (this.beatConfidence * 0.1); // Lower threshold when confident in BPM
+                const threshold = 1.15 - (this.beatConfidence * 0.1);
                 const beatDetected = this.energy > avgEnergy * threshold;
                 this.beat = beatDetected ? energyDiff * 8 : 0;
 
-                // 🎵 BPM TRACKING: Record beat timestamps
-                if (beatDetected && this.audioTime - this.lastBeatTime > 0.2) { // Debounce (200ms min)
+                if (beatDetected && this.audioTime - this.lastBeatTime > 0.2) {
                     this.beatHistory.push(this.audioTime);
-                    if (this.beatHistory.length > 8) this.beatHistory.shift(); // Keep last 8 beats
-
+                    if (this.beatHistory.length > 8) this.beatHistory.shift();
                     this.lastBeatTime = this.audioTime;
                     this.detectBPM();
 
-                    // 🚀 SCHEDULE FUTURE VISUAL EVENTS (Predictive sync!)
                     if (this.beatInterval > 0 && this.beatConfidence > 0.5) {
                         const nextBeat = this.audioTime + this.beatInterval;
-
-                        // Pre-schedule particle explosion for next beat
                         this.scheduleEvent(nextBeat, (data) => {
-                            // This fires EXACTLY on the beat in visual time!
                             agents.forEach(a => {
                                 const angle = Math.random() * Math.PI * 2;
-                                const force = data.intensity * 20;
+                                const force = data.intensity * 15;
                                 a.vx += Math.cos(angle) * force;
                                 a.vy += Math.sin(angle) * force;
                             });
-
-                            // Spawn sparks on beat
-                            for (let i = 0; i < Math.floor(data.intensity * 30); i++) {
+                            for (let i = 0; i < Math.floor(data.intensity * 20); i++) {
                                 sparks.push(new Spark(
                                     CX + (Math.random() - 0.5) * 200,
                                     CY + (Math.random() - 0.5) * 200
@@ -761,7 +734,7 @@
                     }
                 }
 
-                // Pitch detection (simplified autocorrelation)
+                // Pitch detection
                 if (this.bufferLength > 0) {
                     let maxCorr = 0, bestLag = 0;
                     for (let lag = 20; lag < 200; lag++) {
@@ -769,10 +742,7 @@
                         for (let i = 0; i < this.bufferLength - lag; i++) {
                             corr += this.dataArray[i] * this.dataArray[i + lag];
                         }
-                        if (corr > maxCorr) {
-                            maxCorr = corr;
-                            bestLag = lag;
-                        }
+                        if (corr > maxCorr) { maxCorr = corr; bestLag = lag; }
                     }
                     this.pitch = this.audioContext.sampleRate / (bestLag * 2);
                     this.pitchConfidence = maxCorr / (this.bufferLength * 255 * 255);
@@ -791,53 +761,24 @@
                 }
                 this.lastDataArray.set(this.dataArray);
 
-                // Effects
                 this.chromatic = this.onset * 5;
                 this.bloom = this.beat * 0.5;
                 this.distortion = this.spectralFlux * 3;
 
-                // Auto mode change on flux (now synced to beat phase)
                 if (this.spectralFlux > 0.25 && Math.random() < 0.3) {
                     const modes = ['explosion', 'tornado', 'chaos', 'quantum', 'plasma'];
                     this.mode = modes[Math.floor(Math.random() * modes.length)];
                 }
 
-                // Intensity modulation (smoothed to avoid jank)
                 if (this.beat > 0.15) {
                     this.intensity = Math.min(3, this.intensity + this.beat * 6);
                 }
-
-                // NOTE: Beat explosions now handled by scheduled events (see BPM tracking above)
-                // This eliminates the ~67ms lag from the old immediate-trigger approach!
             }
         };
 
-        // Noise
-        function noise(x, y, seed = 0) {
-            const n = Math.sin(x * 12.9898 + y * 78.233 + seed * 45.164) * 43758.5453123;
-            return n - Math.floor(n);
-        }
-
-        // 🌊 PERLIN NOISE (for organic evolution)
-        function perlin(x, octaves = 4) {
-            let value = 0;
-            let amplitude = 1;
-            let frequency = 1;
-            let maxValue = 0;
-
-            for (let i = 0; i < octaves; i++) {
-                const sampleX = x * frequency;
-                const noise = Math.sin(sampleX) * 0.5 + Math.cos(sampleX * 1.3) * 0.5;
-                value += noise * amplitude;
-                maxValue += amplitude;
-                amplitude *= 0.5;
-                frequency *= 2;
-            }
-
-            return value / maxValue; // Normalize to -1 to 1
-        }
-
-        // AGENT
+        // =============================================
+        // AGENT (PARTICLE)
+        // =============================================
         class Agent {
             constructor(x, y, id) {
                 this.x = x; this.y = y;
@@ -847,29 +788,30 @@
                 this.id = id;
                 this.energy = 1;
                 this.phase = Math.random() * Math.PI * 2;
-                this.neighbors = [];
                 this.age = 0;
-                this.imageColorHint = null; // 🎨 Subtle color from image data
-                this.colorOffset = Math.random() * 360; // 🌈 UNIQUE color per particle
-                this.glitchAmount = 0; // 💥 Glitch intensity
-                this.assignedAttractor = null; // 🆕 PARTICLE ASSIGNMENT: Each particle owns ONE attractor
-                this.attractorIndex = -1; // Index in imageAttractors array
+                this.colorOffset = Math.random() * 360;
+
+                // Image targets (smooth morphing)
+                this.targetX = x;
+                this.targetY = y;
+                this.targetR = 128;
+                this.targetG = 128;
+                this.targetB = 128;
+
+                // Current display color (interpolated)
+                this.dispR = 128;
+                this.dispG = 128;
+                this.dispB = 128;
             }
 
             modeForces() {
-                // 🎨 TOTAL SHUTDOWN when form is active - NO CIRCLES, NO CORNERS!
-                const formProgress = U.formSystem.formReady ? U.formSystem.morphProgress : 0;
-
-                // COMPLETE KILL during form display (not just formation)
-                if (U.formSystem.formReady && formProgress < 0.9) {
-                    return; // EXIT IMMEDIATELY - no mode forces at all!
-                }
+                // Suppress mode forces during image formation
+                if (U.imageSystem.imageReady && U.imageSystem.morphProgress < 0.85) return;
 
                 const dx = CX - this.x, dy = CY - this.y;
                 const dist = Math.sqrt(dx * dx + dy * dy);
                 const angle = Math.atan2(dy, dx);
                 const I = U.intensity;
-
                 const bassMult = 1 + U.bass * 10;
                 const midMult = 1 + U.mid * 8;
                 const highMult = 1 + U.high * 6;
@@ -883,21 +825,23 @@
                         this.ax += dx * 0.006 * I * bassMult;
                         this.ay += dy * 0.006 * I * bassMult;
                         break;
-                    case 'tornado':
+                    case 'tornado': {
                         const tangent = angle + Math.PI / 2;
                         this.ax += Math.cos(tangent) * 0.4 * I * midMult;
                         this.ay += Math.sin(tangent) * 0.4 * I * midMult;
                         break;
+                    }
                     case 'chaos':
                         this.ax += (Math.random() - 0.5) * 0.8 * I * highMult;
                         this.ay += (Math.random() - 0.5) * 0.8 * I * highMult;
                         break;
-                    case 'waves':
+                    case 'waves': {
                         const waveFreq = 30 / (1 + U.mid * 3);
                         const wave = Math.sin(dist / waveFreq - U.t / 8) * I;
                         this.ax += Math.cos(angle) * wave * 0.3 * midMult;
                         this.ay += Math.sin(angle) * wave * 0.3 * midMult;
                         break;
+                    }
                     case 'vortex':
                         for (let i = 0; i < 4; i++) {
                             const vAngle = (i / 4) * Math.PI * 2 + U.t / 40;
@@ -911,7 +855,6 @@
                         }
                         break;
                     case 'quantum':
-                        // Quantum tunneling
                         if (Math.random() < 0.005 * I) {
                             this.x = CX + (Math.random() - 0.5) * W * 0.6;
                             this.y = CY + (Math.random() - 0.5) * H * 0.6;
@@ -919,37 +862,33 @@
                         this.ax += (Math.random() - 0.5) * 0.3 * I;
                         this.ay += (Math.random() - 0.5) * 0.3 * I;
                         break;
-                    case 'magnetic':
-                        // Field lines
+                    case 'magnetic': {
                         const fieldAngle = Math.atan2(this.y - CY, this.x - CX);
                         const fieldStrength = Math.sin(fieldAngle * 3 + U.t / 20) * 0.2 * I;
                         this.ax += Math.cos(fieldAngle) * fieldStrength;
                         this.ay += Math.sin(fieldAngle) * fieldStrength;
                         break;
-                    case 'plasma':
+                    }
+                    case 'plasma': {
                         const plasma = Math.sin(this.x / 50 + U.t / 10) +
                                       Math.sin(this.y / 50 + U.t / 10) +
                                       Math.sin((this.x + this.y) / 50 + U.t / 10);
                         this.ax += Math.cos(plasma) * 0.2 * I;
                         this.ay += Math.sin(plasma) * 0.2 * I;
                         break;
+                    }
                 }
             }
 
             attractorInfluence() {
-                // 🎨 TOTAL KILL when form is active
-                if (U.formSystem.formReady && U.formSystem.morphProgress < 0.9) {
-                    return; // NO random attractors during form display!
-                }
+                if (U.imageSystem.imageReady && U.imageSystem.morphProgress < 0.85) return;
 
                 U.attractors.forEach(a => {
                     const dx = a.x - this.x, dy = a.y - this.y;
                     const dist = Math.sqrt(dx * dx + dy * dy);
                     if (dist < a.radius && dist > 0) {
                         let force = a.strength * (1 - dist / a.radius);
-                        if (a.type === 'strange') {
-                            force *= Math.sin(U.t / 10 + a.phase);
-                        }
+                        if (a.type === 'strange') force *= Math.sin(U.t / 10 + a.phase);
                         this.ax += (dx / dist) * force * 0.15;
                         this.ay += (dy / dist) * force * 0.15;
                     }
@@ -963,11 +902,9 @@
                     if (dist < z.radius) {
                         const force = z.strength * (1 - dist / z.radius);
                         if (z.hot) {
-                            // Hot zone - repel
                             this.ax -= (dx / dist) * force * 0.1;
                             this.ay -= (dy / dist) * force * 0.1;
                         } else {
-                            // Cold zone - attract
                             this.ax += (dx / dist) * force * 0.1;
                             this.ay += (dy / dist) * force * 0.1;
                         }
@@ -975,40 +912,69 @@
                 });
             }
 
-            // 🌌 IMAGE ATTRACTOR INFLUENCE: PARTICLE ASSIGNMENT - morph to assigned position
-            formInfluence() {
-                const form = U.formSystem;
-                if (!form.formReady || !this.assignedAttractor) return;
+            // SMOOTH IMAGE MORPHING (the core of the new system)
+            imageInfluence() {
+                const img = U.imageSystem;
+                if (!img.imageReady) return;
 
-                const target = this.assignedAttractor;
-                const dx = target.x - this.x;
-                const dy = target.y - this.y;
-                const dist = Math.hypot(dx, dy);
+                const morph = img.morphProgress;
 
-                if (dist === 0) return;
+                // === SMOOTH EASE-OUT CUBIC MORPHING ===
+                // pos += (target - pos) * lerpFactor
+                const lerpSpeed = 0.08; // Smooth glide, no teleport
 
-                // 🎯 SMOOTH PROGRESSIVE MORPHING (no lag!)
-                const progress = form.morphProgress;
+                // Morph position toward target
+                this.x += (this.targetX - this.x) * lerpSpeed * morph;
+                this.y += (this.targetY - this.y) * lerpSpeed * morph;
 
-                // Smooth force curve: starts gentle, peaks at 50%, eases out
-                const forceCurve = Math.sin(progress * Math.PI); // 0 → 1 → 0
-                const baseForce = 5.0 + forceCurve * 15.0; // 5-20 (no nuclear 80!)
+                // Morph color toward target
+                this.dispR += (this.targetR - this.dispR) * 0.06;
+                this.dispG += (this.targetG - this.dispG) * 0.06;
+                this.dispB += (this.targetB - this.dispB) * 0.06;
 
-                // Audio-reactive modulation
-                const audioBoost = 1 + U.bass * 0.5 + U.high * 0.3;
-
-                // Apply smooth attraction force
-                this.ax += (dx / dist) * baseForce * audioBoost;
-                this.ay += (dy / dist) * baseForce * audioBoost;
-
-                // Velocity damping - smooth throughout
-                const dampening = 0.92 - progress * 0.15; // 0.92 → 0.77
+                // Dampen velocity during morphing (more damping early)
+                const dampening = 0.85 + (1 - morph) * 0.12; // 0.97 early, 0.85 late
                 this.vx *= dampening;
                 this.vy *= dampening;
 
-                // 🎨 USE FORM COLOR
-                if (target.color) {
-                    this.imageColorHint = target.color;
+                // === AUDIO-REACTIVE WITHIN SHAPE ===
+                if (morph > 0.3) {
+                    // Bass = size pulse (handled in draw)
+
+                    // Mid = gentle vibration around target position
+                    const vibAmount = U.mid * 3;
+                    this.x += (Math.random() - 0.5) * vibAmount;
+                    this.y += (Math.random() - 0.5) * vibAmount;
+
+                    // High = scatter/jitter
+                    if (U.high > 0.3) {
+                        this.x += (Math.random() - 0.5) * U.high * 6;
+                        this.y += (Math.random() - 0.5) * U.high * 6;
+                    }
+
+                    // Beat = flash + small burst (handled in draw for flash)
+                    if (U.beat > 0.3) {
+                        const angle = Math.random() * Math.PI * 2;
+                        this.vx += Math.cos(angle) * U.beat * 3;
+                        this.vy += Math.sin(angle) * U.beat * 3;
+                    }
+                }
+
+                // === FLOW FIELD during transitions ===
+                if (U.flowField.active && morph < 0.5) {
+                    const ff = U.flowField;
+                    const noiseVal = perlin2d(
+                        this.x * ff.scale + ff.time,
+                        this.y * ff.scale + ff.noiseZ
+                    );
+                    const flowAngle = noiseVal * Math.PI * 4;
+
+                    // Audio modulates flow field
+                    const amplitude = ff.strength * (1 + U.bass * 3); // Bass = amplitude
+                    const freqMod = 1 + U.high * 2; // High = noise frequency
+
+                    this.vx += Math.cos(flowAngle) * amplitude * (1 - morph * 2) * freqMod * 0.3;
+                    this.vy += Math.sin(flowAngle) * amplitude * (1 - morph * 2) * freqMod * 0.3;
                 }
             }
 
@@ -1021,7 +987,7 @@
                 this.vy *= friction;
 
                 const maxSpeed = U.mode === 'explosion' ? 15 : (U.mode === 'quantum' ? 20 : 10);
-                const speed = Math.sqrt(this.vx ** 2 + this.vy ** 2);
+                const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
                 if (speed > maxSpeed) {
                     this.vx = (this.vx / speed) * maxSpeed;
                     this.vy = (this.vy / speed) * maxSpeed;
@@ -1031,10 +997,10 @@
                 this.y += this.vy;
 
                 // Wrap
-                if (this.x < 0) this.x = W;
-                if (this.x > W) this.x = 0;
-                if (this.y < 0) this.y = H;
-                if (this.y > H) this.y = 0;
+                if (this.x < -20) this.x = W + 20;
+                if (this.x > W + 20) this.x = -20;
+                if (this.y < -20) this.y = H + 20;
+                if (this.y > H + 20) this.y = -20;
 
                 this.ax = 0; this.ay = 0;
                 this.energy = 0.6 + Math.sin(U.t / 25 + this.id / 8) * 0.4;
@@ -1042,83 +1008,52 @@
             }
 
             draw() {
-                // 💥 GLITCH POSITION on beats
                 let drawX = this.x;
                 let drawY = this.y;
+
+                // Beat glitch position
                 if (U.beat > 0.2 && Math.random() < U.beat) {
-                    drawX += (Math.random() - 0.5) * U.beat * 20;
-                    drawY += (Math.random() - 0.5) * U.beat * 20;
+                    drawX += (Math.random() - 0.5) * U.beat * 15;
+                    drawY += (Math.random() - 0.5) * U.beat * 15;
                 }
 
-                const dist = Math.hypot(this.x - CX, this.y - CY);
+                const isImageMode = U.imageSystem.imageReady && U.imageSystem.morphProgress > 0.15;
 
-                let color;
+                if (isImageMode) {
+                    // === IMAGE MODE: Direct pixel colors, solid sprites ===
+                    const r = Math.round(this.dispR);
+                    const g = Math.round(this.dispG);
+                    const b = Math.round(this.dispB);
 
-                // 🎨 FORM MODE: Use PURE form colors (NO genome interference!)
-                if (this.imageColorHint && U.formSystem.formReady && U.formSystem.morphProgress > 0.1) {
-                    const hint = this.imageColorHint;
+                    // Bass = particle size pulse
+                    const bassPulse = 1 + U.bass * 1.5;
+                    // Beat = brightness flash
+                    const beatFlash = U.beat > 0.3 ? 40 : 0;
+                    const size = (3 + this.energy * 0.5) * bassPulse;
 
-                    // PURE IMAGE COLOR - no blending!
-                    color = {
-                        h: hint.h || 0,
-                        s: hint.s || 0,
-                        l: hint.l || 50
-                    };
-
-                    // Audio-reactive brightness modulation
-                    color.l = Math.max(20, Math.min(80, color.l + U.energy * 15));
-
-                    // Glitch on beats (color shift, not genome)
-                    if (U.beat > 0.3 && Math.random() < 0.2) {
-                        color.h = (color.h + Math.random() * 60 - 30) % 360;
-                    }
+                    const sprite = getSolidSprite(
+                        size,
+                        Math.min(255, r + beatFlash),
+                        Math.min(255, g + beatFlash),
+                        Math.min(255, b + beatFlash)
+                    );
+                    ctx.drawImage(sprite, drawX - sprite.width / 2, drawY - sprite.height / 2);
                 } else {
-                    // FREE MODE: Use color genome
+                    // === FREE MODE: Genome colors, glow sprites ===
+                    const dist = Math.hypot(this.x - CX, this.y - CY);
                     const variation = dist / 2 + this.id * 5 + this.colorOffset;
-                    color = U.getColorFromGenome(variation, this.energy);
+                    const color = U.getColorFromGenome(variation, this.energy);
 
-                    // Glitch corruption on beats
+                    // Beat color corruption
                     if (U.beat > 0.25 && Math.random() < 0.3) {
                         color.h = Math.random() * 360;
                         color.s = 80 + Math.random() * 20;
                     }
-                }
 
-                // 🎯 SIZE: Bigger during morphing for clear shapes
-                const isFormMode = U.formSystem.formReady && U.formSystem.morphProgress < 0.6;
-                const baseSize = isFormMode ? 4 : 2;
-                const size = baseSize + this.energy * 1.5 + U.onset * 2;
-
-                // SIMPLE RENDERING during morphing (no glow = clearer shapes!)
-                if (isFormMode) {
-                    // Solid particles for crisp shapes
-                    ctx.fillStyle = `hsla(${color.h}, ${color.s}%, ${color.l}%, 0.9)`;
-                    ctx.beginPath();
-                    ctx.arc(drawX, drawY, size, 0, Math.PI * 2);
-                    ctx.fill();
-
-                    // Small bright core
-                    ctx.fillStyle = `hsla(${color.h}, ${Math.min(100, color.s + 20)}%, ${Math.min(95, color.l + 25)}%, 1)`;
-                    ctx.beginPath();
-                    ctx.arc(drawX, drawY, size * 0.4, 0, Math.PI * 2);
-                    ctx.fill();
-                } else {
-                    // Glow mode when free (use glitched position)
-                    const gradient = ctx.createRadialGradient(drawX, drawY, 0, drawX, drawY, size * 3);
-                    gradient.addColorStop(0, `hsla(${color.h}, ${color.s}%, ${color.l + 30}%, 0.95)`);
-                    gradient.addColorStop(0.4, `hsla(${color.h}, ${color.s}%, ${color.l + 10}%, 0.6)`);
-                    gradient.addColorStop(1, `hsla(${color.h}, ${Math.max(0, color.s - 20)}%, ${color.l - 10}%, 0)`);
-
-                    ctx.fillStyle = gradient;
-                    ctx.beginPath();
-                    ctx.arc(drawX, drawY, size * 3, 0, Math.PI * 2);
-                    ctx.fill();
-
-                    // Core
-                    ctx.fillStyle = `hsla(${color.h}, ${Math.min(100, color.s + 15)}%, ${Math.min(90, color.l + 35)}%, ${this.energy})`;
-                    ctx.beginPath();
-                    ctx.arc(drawX, drawY, size * 0.6, 0, Math.PI * 2);
-                    ctx.fill();
+                    const size = 2 + this.energy * 1.5 + U.onset * 2;
+                    const [cr, cg, cb] = hslToRgb(color.h, color.s, color.l);
+                    const sprite = getSprite(size * 2.5, cr, cg, cb, this.energy * 0.85);
+                    ctx.drawImage(sprite, drawX - sprite.width / 2, drawY - sprite.height / 2);
                 }
             }
         }
@@ -1133,7 +1068,7 @@
                 this.vy = Math.sin(angle) * speed;
                 this.life = 1;
                 this.size = 1 + Math.random() * 2;
-                this.colorVariation = Math.random() * 60; // 🧬 Use for color genome
+                this.colorVariation = Math.random() * 60;
             }
 
             update() {
@@ -1146,19 +1081,23 @@
             }
 
             draw() {
-                // 🧬 USE COLOR GENOME
                 const color = U.getColorFromGenome(this.colorVariation, this.life);
-                ctx.fillStyle = `hsla(${color.h}, ${Math.min(100, color.s + 15)}%, ${Math.min(90, color.l + 20)}%, ${this.life})`;
+                const [r, g, b] = hslToRgb(color.h, color.s, color.l);
+                ctx.globalAlpha = this.life;
+                ctx.fillStyle = `rgb(${r},${g},${b})`;
                 ctx.beginPath();
                 ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
                 ctx.fill();
+                ctx.globalAlpha = 1;
             }
         }
 
-        // Initialize
+        // =============================================
+        // INITIALIZE
+        // =============================================
         const agents = [];
         const sparks = [];
-        const AGENT_COUNT = 800; // Balanced: detail + performance
+        const AGENT_COUNT = 500; // Sweet spot: detail + 60fps
 
         for (let i = 0; i < AGENT_COUNT; i++) {
             const angle = (i / AGENT_COUNT) * Math.PI * 2;
@@ -1170,39 +1109,32 @@
             ));
         }
 
-        // 🎨 INITIALIZE FORM SYSTEM
-        console.log('🎨 Procedural Forms System initialized');
+        // Initialize image system
+        U.initImageSystem();
+        console.log('Image + Flow Field system initialized');
 
+        // =============================================
         // MAIN LOOP
+        // =============================================
         function loop() {
             const now = performance.now();
             U.fps = Math.round(1000 / (now - U.lastTime));
             U.lastTime = now;
-
             U.t += 0.016;
 
-            // 🎯 DUAL-CLOCK SYNC: Update clocks FIRST (critical timing!)
+            // Dual-clock sync
             U.updateAudioClock();
-
-            // 🎵 PLL: Update beat phase prediction
             U.updateBeatPhase();
 
             U.updateEntropy();
             U.analyzeAudio();
-
-            // ⚡ PROCESS SCHEDULED EVENTS: Trigger pre-scheduled visual hits
             U.processScheduledEvents();
-
-            // 🧬 EVOLVE COLOR GENOME: Organic color consciousness
             U.evolveColorGenome();
-
-            // 🎨 UPDATE FORM SYSTEM: Morphing geometric shapes
-            U.updateFormSystem();
-
+            U.updateImageSystem();
             U.updateMode();
             U.updateAttractors();
 
-            // Legacy hue (kept for beat indicator, but color genome is primary)
+            // Legacy hue for beat indicator
             let hueShift;
             if (U.audioActive && U.beatConfidence > 0.5) {
                 hueShift = U.beatPhase * 30 + U.onset * 80;
@@ -1213,15 +1145,14 @@
             }
             U.hue = (U.hue + hueShift) % 360;
 
-            // Clear with trail (stronger clear during form morphing for crisp shapes!)
-            const clearStrength = U.formSystem.formReady && U.formSystem.morphProgress < 0.6 ? 0.12 : 0.05;
-            const trailAlpha = U.beat > 0.3 ? 0.4 : clearStrength;
+            // Clear with trail
+            const isImageForming = U.imageSystem.imageReady && U.imageSystem.morphProgress < 0.5;
+            const clearStrength = isImageForming ? 0.12 : 0.05;
+            const trailAlpha = U.beat > 0.3 ? 0.35 : clearStrength;
             ctx.fillStyle = `rgba(0, 0, 0, ${trailAlpha})`;
             ctx.fillRect(0, 0, W, H);
 
-            // 🌌 IMAGE IS INVISIBLE - particles dance & suggest shapes
-
-            // Random events
+            // Random shockwaves
             if (Math.random() < 0.004) {
                 const shockX = Math.random() * W, shockY = Math.random() * H;
                 agents.forEach(a => {
@@ -1236,7 +1167,7 @@
             }
 
             // Mitosis
-            if (U.mode === 'mitosis' && agents.length < 800 && Math.random() < 0.01) {
+            if (U.mode === 'mitosis' && agents.length < 500 && Math.random() < 0.01) {
                 const parent = agents[Math.floor(Math.random() * agents.length)];
                 agents.push(new Agent(
                     parent.x + (Math.random() - 0.5) * 20,
@@ -1250,23 +1181,23 @@
                 a.modeForces();
                 a.attractorInfluence();
                 a.zoneInfluence();
-                a.formInfluence(); // 🎨 Form-based forces
+                a.imageInfluence();
                 a.update();
             });
 
-            // Draw connections (DISABLED during form morphing for clarity!)
-            const showConnections = !U.formSystem.formReady || U.formSystem.morphProgress > 0.7;
+            // Connections (SKIP during image formation, use spatial check not O(n^2))
+            const showConnections = !U.imageSystem.imageReady || U.imageSystem.morphProgress > 0.85;
             if (showConnections) {
-                agents.forEach((a, i) => {
-                    if (i % 3 !== 0) return;
-                    agents.forEach((b, j) => {
-                        if (j <= i) return;
+                // Only check every 5th particle, and limit neighbor search
+                for (let i = 0; i < agents.length; i += 5) {
+                    const a = agents[i];
+                    for (let j = i + 1; j < Math.min(i + 20, agents.length); j++) {
+                        const b = agents[j];
                         const dx = b.x - a.x, dy = b.y - a.y;
-                        const dist = Math.sqrt(dx * dx + dy * dy);
-                        if (dist < 100) {
-                            const alpha = (1 - dist / 100) * 0.2;
-
-                            // 🧬 USE COLOR GENOME for connections
+                        const distSq = dx * dx + dy * dy;
+                        if (distSq < 10000) { // 100^2
+                            const dist = Math.sqrt(distSq);
+                            const alpha = (1 - dist / 100) * 0.15;
                             const color = U.getColorFromGenome(dist, 0.6);
                             ctx.strokeStyle = `hsla(${color.h}, ${color.s}%, ${color.l}%, ${alpha})`;
                             ctx.lineWidth = 0.5;
@@ -1275,16 +1206,16 @@
                             ctx.lineTo(b.x, b.y);
                             ctx.stroke();
                         }
-                    });
-                });
+                    }
+                }
             }
 
             // Draw agents
             agents.forEach(a => a.draw());
 
-            // 🎵 VISUAL BEAT INDICATOR: Pulsing ring synced to beat phase
+            // Beat indicator ring
             if (U.beatPhase > 0 && U.beatConfidence > 0.5) {
-                const ringPhase = U.beatPhase; // 0-1
+                const ringPhase = U.beatPhase;
                 const ringSize = 30 + ringPhase * 80;
                 const ringAlpha = (1 - ringPhase) * 0.6;
 
@@ -1294,7 +1225,6 @@
                 ctx.arc(CX, CY, ringSize, 0, Math.PI * 2);
                 ctx.stroke();
 
-                // Inner pulse on beat hit (phase near 0)
                 if (ringPhase < 0.15) {
                     const hitAlpha = (0.15 - ringPhase) / 0.15;
                     ctx.fillStyle = `hsla(${U.hue}, 100%, 70%, ${hitAlpha * 0.3})`;
@@ -1313,22 +1243,19 @@
                 }
             }
 
-            // POST-PROCESSING EFFECTS
+            // POST-PROCESSING
             fxCtx.clearRect(0, 0, W, H);
 
-            // 💥 CHROMATIC ABERRATION (GLITCH MODE!)
+            // Chromatic aberration
             if (U.chromatic > 0.1 || U.beat > 0.3) {
-                const shift = Math.max(U.chromatic * 5, U.beat * 15); // BIGGER glitch on beats!
+                const shift = Math.max(U.chromatic * 5, U.beat * 15);
                 fxCtx.globalAlpha = 0.4;
                 fxCtx.globalCompositeOperation = 'screen';
                 fxCtx.drawImage(baseCanvas, -shift, 0);
                 fxCtx.drawImage(baseCanvas, shift, 0);
-
-                // Extra glitch: vertical offset on big beats
                 if (U.beat > 0.4) {
                     fxCtx.drawImage(baseCanvas, 0, -shift * 0.5);
                 }
-
                 fxCtx.globalAlpha = 1;
                 fxCtx.globalCompositeOperation = 'source-over';
             }
@@ -1355,28 +1282,27 @@
             document.getElementById('pitch').textContent = U.pitchConfidence > 0.01 ?
                 U.pitch.toFixed(0) + 'Hz' : '-';
 
-            // 🎵 SYNC ENGINE UI
             document.getElementById('bpm').textContent = U.bpm > 0 ?
-                U.bpm.toFixed(0) + (U.beatConfidence > 0.7 ? '✓' : '?') : '-';
+                U.bpm.toFixed(0) + (U.beatConfidence > 0.7 ? 'ok' : '?') : '-';
             document.getElementById('phase').textContent = U.beatPhase > 0 ?
                 (U.beatPhase * 100).toFixed(0) + '%' : '-';
             document.getElementById('latency').textContent = (U.latencyCompensation * 1000).toFixed(0);
 
-            // 🧬 COLOR GENOME UI
             document.getElementById('colormode').textContent = U.colorGenome.harmonyMode.toUpperCase();
 
-            // 🎨 FORM SYSTEM UI
-            const formName = U.formSystem.currentForm || '-';
-            const formProgress = U.formSystem.formReady ? (U.formSystem.morphProgress * 100).toFixed(0) : 0;
-            document.getElementById('imagestate').textContent = U.formSystem.formReady ?
-                `${formName.toUpperCase()} ${formProgress}%` : 'INIT';
+            const imgCount = U.imageSystem.imageAttractors.length;
+            const sm = U.imageSystem.shapeMode ? U.imageSystem.shapeMode[0].toUpperCase() : 'F';
+            document.getElementById('imagestate').textContent = U.imageSystem.imageReady ?
+                `${sm}:${imgCount}p ${(U.imageSystem.morphProgress * 100).toFixed(0)}%` : 'SCAN';
 
             requestAnimationFrame(loop);
         }
 
         loop();
 
+        // =============================================
         // AUDIO INIT
+        // =============================================
         document.getElementById('audioBtn').addEventListener('click', async () => {
             try {
                 let stream;
@@ -1415,7 +1341,7 @@
                 U.dataArray = new Uint8Array(U.bufferLength);
                 U.audioActive = true;
 
-                document.getElementById('audioBtn').textContent = 'AUDIO ON ⚡';
+                document.getElementById('audioBtn').textContent = 'AUDIO ON';
                 document.getElementById('audioBtn').style.background = 'rgba(0,255,0,0.5)';
 
             } catch (err) {
@@ -1424,7 +1350,7 @@
             }
         });
 
-        // Mouse
+        // Mouse interaction
         baseCanvas.addEventListener('click', (e) => {
             const force = 8;
             agents.forEach(a => {
@@ -1435,33 +1361,46 @@
                     a.vy += (dy / dist) * force;
                 }
             });
-
             for (let i = 0; i < 50; i++) {
                 sparks.push(new Spark(e.clientX, e.clientY));
             }
         });
 
-        // ⚡ LATENCY CALIBRATION: Arrow keys to adjust sync timing
+        // Keyboard controls
         window.addEventListener('keydown', (e) => {
             if (e.key === 'ArrowUp') {
-                U.latencyCompensation += 0.005; // +5ms
+                U.latencyCompensation += 0.005;
                 console.log(`Latency: ${(U.latencyCompensation * 1000).toFixed(0)}ms`);
             } else if (e.key === 'ArrowDown') {
-                U.latencyCompensation = Math.max(0, U.latencyCompensation - 0.005); // -5ms
+                U.latencyCompensation = Math.max(0, U.latencyCompensation - 0.005);
                 console.log(`Latency: ${(U.latencyCompensation * 1000).toFixed(0)}ms`);
             } else if (e.key === 'r' || e.key === 'R') {
-                // Reset to default
                 U.latencyCompensation = 0.035;
                 console.log('Latency reset to 35ms');
-            } else if (e.key === 'f' || e.key === 'F') {
-                // 🎨 Force new form
-                U.selectRandomForm();
-                console.log('🎨 Generating new form...');
+            } else if (e.key === 'i' || e.key === 'I') {
+                // Force new image
+                U.imageSystem.prefetchReady = false;
+                U.fetchRandomImage();
+                // Auto-apply when ready
+                const checkInterval = setInterval(() => {
+                    if (U.imageSystem.prefetchReady) {
+                        clearInterval(checkInterval);
+                        U.startImageTransition();
+                    }
+                }, 100);
+                console.log('Loading new image...');
             } else if (e.key === 'm' || e.key === 'M') {
-                // 🧬 Force color mutation
                 const modes = ['mono', 'duo', 'triad', 'multi', 'bw'];
                 U.colorGenome.harmonyMode = modes[Math.floor(Math.random() * modes.length)];
-                console.log(`🧬 Color mode: ${U.colorGenome.harmonyMode}`);
+                console.log(`Color mode: ${U.colorGenome.harmonyMode}`);
+            } else if (e.key === 's' || e.key === 'S') {
+                const shapeModes = ['filled', 'lines', 'hybrid'];
+                const currentIdx = shapeModes.indexOf(U.imageSystem.shapeMode);
+                U.imageSystem.shapeMode = shapeModes[(currentIdx + 1) % 3];
+                console.log(`Shape mode: ${U.imageSystem.shapeMode.toUpperCase()}`);
+                if (U.imageSystem.currentImage) {
+                    U.processImage();
+                }
             }
         });
     </script>
