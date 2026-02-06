@@ -7,9 +7,7 @@
     <style>
         * { margin: 0; padding: 0; overflow: hidden; }
         body { background: #000; font-family: monospace; }
-        canvas { display: block; position: absolute; }
-        #base { z-index: 1; }
-        #fx { z-index: 2; }
+        canvas { display: block; }
         #info {
             position: fixed; top: 10px; left: 10px; color: #0f0; font-size: 9px; z-index: 999;
             background: rgba(0,0,0,0.7); padding: 6px; border-radius: 3px;
@@ -27,1382 +25,534 @@
     </style>
 </head>
 <body>
-    <canvas id="base"></canvas>
-    <canvas id="fx"></canvas>
+    <canvas id="c"></canvas>
     <div id="info">
-        <div>FPS: <span id="fps">60</span> | MODE: <span id="mode">INIT</span></div>
-        <div>AUDIO: <span id="audio">OFF</span> | AGENTS: <span id="count">0</span></div>
-        <div style="font-size: 8px">B:<span id="bass">0</span> M:<span id="mid">0</span> H:<span id="high">0</span> P:<span id="pitch">-</span></div>
-        <div style="font-size: 8px; color: #0ff">BPM:<span id="bpm">-</span> BEAT:<span id="phase">-</span> LAT:<span id="latency">35</span>ms</div>
-        <div style="font-size: 8px; color: #f0f">CLR:<span id="colormode">MULTI</span> IMG:<span id="imagestate">-</span></div>
+        <div>FPS: <span id="fps">60</span> | <span id="mode">INIT</span></div>
+        <div>AUDIO: <span id="audio">OFF</span> | P: <span id="count">0</span></div>
+        <div style="font-size: 8px">B:<span id="bass">0</span> M:<span id="mid">0</span> H:<span id="high">0</span></div>
+        <div style="font-size: 8px; color: #0ff">BPM:<span id="bpm">-</span> BEAT:<span id="phase">-</span></div>
+        <div style="font-size: 8px; color: #f0f">IMG:<span id="imagestate">-</span></div>
     </div>
     <button id="audioBtn">START AUDIO</button>
-    <div id="help">Up/Dn Sync | R Reset | I Image | M Color | S Shape</div>
+    <div id="help">Up/Dn Sync | R Reset | I Image</div>
 
     <script>
-        const baseCanvas = document.getElementById('base');
-        const fxCanvas = document.getElementById('fx');
-        const ctx = baseCanvas.getContext('2d', { alpha: false, desynchronized: true });
-        const fxCtx = fxCanvas.getContext('2d', { alpha: true });
+    // SINGLE CANVAS - no fx layer, no bloom, no chromatic = max FPS
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d', { alpha: false });
 
-        let W, H, CX, CY;
-        function resize() {
-            W = baseCanvas.width = fxCanvas.width = window.innerWidth;
-            H = baseCanvas.height = fxCanvas.height = window.innerHeight;
-            CX = W / 2; CY = H / 2;
-        }
-        resize();
-        window.addEventListener('resize', resize);
+    let W, H, CX, CY;
+    function resize() {
+        W = canvas.width = window.innerWidth;
+        H = canvas.height = window.innerHeight;
+        CX = W / 2; CY = H / 2;
+    }
+    resize();
+    window.addEventListener('resize', resize);
 
-        // =============================================
-        // PRE-RENDERED SPRITE SYSTEM (8x faster than arc+gradient)
-        // =============================================
-        const spriteCache = {};
-        function getSprite(size, r, g, b, alpha) {
-            // Quantize to reduce cache entries
-            const qs = Math.round(size * 2) / 2;
-            const qr = (r >> 3) << 3;
-            const qg = (g >> 3) << 3;
-            const qb = (b >> 3) << 3;
-            const qa = Math.round(alpha * 10) / 10;
-            const key = `${qs}_${qr}_${qg}_${qb}_${qa}`;
+    // =========================================
+    // 2D PERLIN NOISE for flow field
+    // =========================================
+    const P = new Uint8Array(512);
+    for (let i = 0; i < 256; i++) P[i] = i;
+    for (let i = 255; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [P[i], P[j]] = [P[j], P[i]]; }
+    for (let i = 0; i < 256; i++) P[i + 256] = P[i];
 
-            if (spriteCache[key]) return spriteCache[key];
-
-            const d = Math.ceil(qs * 2 + 2);
-            const c = document.createElement('canvas');
-            c.width = c.height = d;
-            const sctx = c.getContext('2d');
-            const cx = d / 2, cy = d / 2;
-
-            // Glow gradient
-            const grad = sctx.createRadialGradient(cx, cy, 0, cx, cy, qs);
-            grad.addColorStop(0, `rgba(${Math.min(255, qr + 60)}, ${Math.min(255, qg + 60)}, ${Math.min(255, qb + 60)}, ${qa})`);
-            grad.addColorStop(0.4, `rgba(${qr}, ${qg}, ${qb}, ${qa * 0.7})`);
-            grad.addColorStop(1, `rgba(${qr}, ${qg}, ${qb}, 0)`);
-            sctx.fillStyle = grad;
-            sctx.fillRect(0, 0, d, d);
-
-            // Limit cache size
-            const keys = Object.keys(spriteCache);
-            if (keys.length > 500) {
-                for (let i = 0; i < 100; i++) delete spriteCache[keys[i]];
-            }
-
-            spriteCache[key] = c;
-            return c;
-        }
-
-        // Solid sprite for image mode (crisp, no glow)
-        const solidSpriteCache = {};
-        function getSolidSprite(size, r, g, b) {
-            const qs = Math.round(size * 2) / 2;
-            const qr = (r >> 2) << 2;
-            const qg = (g >> 2) << 2;
-            const qb = (b >> 2) << 2;
-            const key = `${qs}_${qr}_${qg}_${qb}`;
-
-            if (solidSpriteCache[key]) return solidSpriteCache[key];
-
-            const d = Math.ceil(qs * 2 + 2);
-            const c = document.createElement('canvas');
-            c.width = c.height = d;
-            const sctx = c.getContext('2d');
-            const cx = d / 2, cy = d / 2;
-
-            sctx.fillStyle = `rgb(${qr},${qg},${qb})`;
-            sctx.beginPath();
-            sctx.arc(cx, cy, qs, 0, Math.PI * 2);
-            sctx.fill();
-
-            // Bright core
-            sctx.fillStyle = `rgba(${Math.min(255, qr + 80)}, ${Math.min(255, qg + 80)}, ${Math.min(255, qb + 80)}, 0.6)`;
-            sctx.beginPath();
-            sctx.arc(cx, cy, qs * 0.35, 0, Math.PI * 2);
-            sctx.fill();
-
-            const skeys = Object.keys(solidSpriteCache);
-            if (skeys.length > 500) {
-                for (let i = 0; i < 100; i++) delete solidSpriteCache[skeys[i]];
-            }
-
-            solidSpriteCache[key] = c;
-            return c;
-        }
-
-        // =============================================
-        // 2D PERLIN NOISE (for flow field between images)
-        // =============================================
-        const permutation = [];
-        for (let i = 0; i < 256; i++) permutation[i] = i;
-        for (let i = 255; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [permutation[i], permutation[j]] = [permutation[j], permutation[i]];
-        }
-        const perm = [...permutation, ...permutation];
-
-        function fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
-        function lerp(a, b, t) { return a + t * (b - a); }
-        function grad2d(hash, x, y) {
+    function perlin2d(x, y) {
+        const xi = Math.floor(x) & 255, yi = Math.floor(y) & 255;
+        const xf = x - Math.floor(x), yf = y - Math.floor(y);
+        const u = xf * xf * xf * (xf * (xf * 6 - 15) + 10);
+        const v = yf * yf * yf * (yf * (yf * 6 - 15) + 10);
+        const aa = P[P[xi] + yi], ab = P[P[xi] + yi + 1];
+        const ba = P[P[xi + 1] + yi], bb = P[P[xi + 1] + yi + 1];
+        const g = (hash, fx, fy) => {
             const h = hash & 3;
-            const u = h < 2 ? x : -x;
-            const v = h === 0 || h === 3 ? y : -y;
-            return u + v;
-        }
+            return (h < 2 ? fx : -fx) + (h === 0 || h === 3 ? fy : -fy);
+        };
+        return (1 - v) * ((1 - u) * g(aa, xf, yf) + u * g(ba, xf - 1, yf)) +
+               v * ((1 - u) * g(ab, xf, yf - 1) + u * g(bb, xf - 1, yf - 1));
+    }
 
-        function perlin2d(x, y) {
-            const X = Math.floor(x) & 255;
-            const Y = Math.floor(y) & 255;
-            const xf = x - Math.floor(x);
-            const yf = y - Math.floor(y);
-            const u = fade(xf);
-            const v = fade(yf);
-            const aa = perm[perm[X] + Y];
-            const ab = perm[perm[X] + Y + 1];
-            const ba = perm[perm[X + 1] + Y];
-            const bb = perm[perm[X + 1] + Y + 1];
-            return lerp(
-                lerp(grad2d(aa, xf, yf), grad2d(ba, xf - 1, yf), u),
-                lerp(grad2d(ab, xf, yf - 1), grad2d(bb, xf - 1, yf - 1), u),
-                v
-            );
-        }
+    // =========================================
+    // AUDIO STATE
+    // =========================================
+    const A = {
+        active: false, ctx: null, analyser: null,
+        data: null, len: 0,
+        bass: 0, mid: 0, high: 0, energy: 0, beat: 0, onset: 0,
+        bpm: 0, beatPhase: 0, beatInterval: 0, beatConfidence: 0,
+        lastBeatTime: 0, nextBeatTime: 0, beatHistory: [],
+        energyHistory: [], lastData: null, spectralFlux: 0,
 
-        // 1D Perlin for genome evolution
-        function perlin(x, octaves = 4) {
-            let value = 0, amplitude = 1, frequency = 1, maxValue = 0;
-            for (let i = 0; i < octaves; i++) {
-                const sampleX = x * frequency;
-                value += (Math.sin(sampleX) * 0.5 + Math.cos(sampleX * 1.3) * 0.5) * amplitude;
-                maxValue += amplitude;
-                amplitude *= 0.5;
-                frequency *= 2;
+        analyze() {
+            if (!this.active || !this.analyser) return;
+            this.analyser.getByteFrequencyData(this.data);
+
+            const nyquist = this.ctx.sampleRate / 2;
+            const bw = nyquist / this.len;
+            let bs = 0, ms = 0, hs = 0, bc = 0, mc = 0, hc = 0;
+
+            for (let i = 0; i < this.len; i++) {
+                const f = i * bw;
+                if (f < 250) { bs += this.data[i]; bc++; }
+                else if (f < 2000) { ms += this.data[i]; mc++; }
+                else { hs += this.data[i]; hc++; }
             }
-            return value / maxValue;
-        }
 
-        // Simple hash noise
-        function noise(x, y, seed = 0) {
-            const n = Math.sin(x * 12.9898 + y * 78.233 + seed * 45.164) * 43758.5453123;
-            return n - Math.floor(n);
-        }
+            this.bass = (bs / bc / 255) || 0;
+            this.mid = (ms / mc / 255) || 0;
+            this.high = (hs / hc / 255) || 0;
 
-        // HSL to RGB conversion
-        function hslToRgb(h, s, l) {
-            h /= 360; s /= 100; l /= 100;
-            if (s === 0) { const v = Math.round(l * 255); return [v, v, v]; }
-            const hue2rgb = (p, q, t) => {
-                if (t < 0) t += 1;
-                if (t > 1) t -= 1;
-                if (t < 1/6) return p + (q - p) * 6 * t;
-                if (t < 1/2) return q;
-                if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
-                return p;
-            };
-            const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-            const p = 2 * l - q;
-            return [
-                Math.round(hue2rgb(p, q, h + 1/3) * 255),
-                Math.round(hue2rgb(p, q, h) * 255),
-                Math.round(hue2rgb(p, q, h - 1/3) * 255)
-            ];
-        }
+            let eSum = 0;
+            for (let i = 0; i < this.len; i++) eSum += this.data[i] * this.data[i];
+            this.energy = Math.sqrt(eSum / this.len) / 255;
 
-        // =============================================
-        // UNIVERSE STATE
-        // =============================================
-        const U = {
-            t: 0, fps: 60, lastTime: performance.now(),
-            hue: 0, mode: 'calm', modeTimer: 0, intensity: 0.5,
+            this.energyHistory.push(this.energy);
+            if (this.energyHistory.length > 4) this.energyHistory.shift();
+            const avg = this.energyHistory.reduce((a, b) => a + b, 0) / this.energyHistory.length;
 
-            // Audio
-            audioActive: false, audioContext: null, analyser: null,
-            dataArray: null, bufferLength: 0,
-            bass: 0, mid: 0, high: 0, energy: 0, beat: 0,
-            spectralCentroid: 0, spectralFlux: 0, onset: 0,
-            pitch: 0, pitchConfidence: 0,
-            energyHistory: [], lastDataArray: null,
+            const diff = this.energy - avg;
+            this.onset = diff > 0 ? diff * 5 : 0;
+            const thr = 1.15 - (this.beatConfidence * 0.1);
+            const beatHit = this.energy > avg * thr;
+            this.beat = beatHit ? diff * 8 : 0;
 
-            // DUAL-CLOCK SYNC ENGINE
-            audioTime: 0,
-            visualTime: 0,
-            latencyCompensation: 0.035,
-            syncOffset: 0,
+            const now = this.ctx.currentTime;
+            if (beatHit && now - this.lastBeatTime > 0.2) {
+                this.beatHistory.push(now);
+                if (this.beatHistory.length > 8) this.beatHistory.shift();
+                this.lastBeatTime = now;
+                this._detectBPM();
+            }
 
-            // BPM DETECTION & PHASE-LOCKED LOOP
-            bpm: 0,
-            beatPhase: 0,
-            beatInterval: 0,
-            lastBeatTime: 0,
-            nextBeatTime: 0,
-            beatHistory: [],
-            beatConfidence: 0,
-            scheduledEvents: [],
-
-            // Effects
-            chromatic: 0, bloom: 0, distortion: 0,
-
-            // Attractors & zones
-            attractors: [],
-            zones: [],
-
-            // ORGANIC COLOR GENOME
-            colorGenome: {
-                hueGene: Math.random() * 360,
-                hueDrift: (Math.random() - 0.5) * 2,
-                saturationGene: 0.9,
-                saturationDrift: 0,
-                lightnessGene: 0.5,
-                lightnessDrift: 0,
-                harmonyMode: 'multi',
-                chromaticStress: 0,
-                mutationRate: 0.001,
-                noiseOffset: Math.random() * 1000,
-                evolution: 0
-            },
-
-            // IMAGE REALITY FEED
-            imageSystem: {
-                currentImage: null,
-                nextImage: null,
-                imageCanvas: null,
-                imageCtx: null,
-                imageAttractors: [],
-                morphProgress: 0,
-                lastFetchTime: 0,
-                imageReady: false,
-                imageWidth: 0,
-                imageHeight: 0,
-                shapeMode: 'filled',
-                modeChangeCounter: 0,
-                // Transition state
-                transitioning: false,
-                transitionProgress: 0,
-                oldAttractors: [],
-                // Timing
-                imageInterval: 10000, // 10 seconds base
-                prefetchedImage: null,
-                prefetchReady: false,
-                beatsSinceChange: 0
-            },
-
-            // FLOW FIELD state
-            flowField: {
-                active: false,
-                time: 0,
-                scale: 0.003,
-                strength: 2,
-                noiseZ: Math.random() * 1000
-            },
-
-            updateEntropy() {
-                const now = Date.now();
-                this.entropy = (now % 999999 + performance.now() * 17 + this.t * 137.508) % 999999;
-            },
-
-            updateMode() {
-                this.modeTimer++;
-                const canChange = this.beatConfidence > 0.5 ?
-                    (this.beatPhase < 0.1 && Math.random() < 0.3) :
-                    (Math.random() < 0.01 || this.modeTimer > 120 + Math.random() * 100);
-
-                if (canChange) {
-                    this.modeTimer = 0;
-                    const modes = ['calm', 'explosion', 'implosion', 'tornado', 'chaos',
-                                   'waves', 'vortex', 'quantum', 'magnetic', 'mitosis', 'plasma'];
-                    this.mode = modes[Math.floor(Math.random() * modes.length)];
+            // Spectral flux
+            if (this.lastData) {
+                let flux = 0;
+                for (let i = 0; i < this.len; i++) {
+                    const d = this.data[i] - this.lastData[i];
+                    if (d > 0) flux += d * d;
                 }
+                this.spectralFlux = Math.sqrt(flux / this.len) / 255;
+            } else {
+                this.lastData = new Uint8Array(this.len);
+            }
+            this.lastData.set(this.data);
 
-                if (Math.random() < 0.015) this.intensity = Math.random() * 2.5;
-            },
-
-            // DUAL-CLOCK
-            updateAudioClock() {
-                if (!this.audioActive || !this.audioContext) {
-                    this.audioTime = this.visualTime;
-                    return;
-                }
-                this.audioTime = this.audioContext.currentTime;
-                const browserLatency = this.audioContext.outputLatency || 0;
-                this.visualTime = this.audioTime + browserLatency + this.syncOffset;
-            },
-
-            // BPM DETECTION
-            detectBPM() {
-                if (this.beatHistory.length < 4) return;
-                const intervals = [];
-                for (let i = 1; i < this.beatHistory.length; i++) {
-                    intervals.push(this.beatHistory[i] - this.beatHistory[i - 1]);
-                }
-                const validIntervals = intervals.filter(i => i > 0.3 && i < 2.0);
-                if (validIntervals.length < 2) return;
-                const sorted = validIntervals.slice().sort((a, b) => a - b);
-                const median = sorted[Math.floor(sorted.length / 2)];
-                const newBPM = 60 / median;
-                this.bpm = this.bpm === 0 ? newBPM : this.bpm * 0.85 + newBPM * 0.15;
-                this.beatInterval = 60 / this.bpm;
-                const variance = validIntervals.reduce((sum, i) => sum + Math.abs(i - median), 0) / validIntervals.length;
-                this.beatConfidence = Math.max(0, 1 - variance * 5);
-            },
-
-            // PHASE-LOCKED LOOP
-            updateBeatPhase() {
-                if (this.beatInterval === 0 || this.lastBeatTime === 0) return;
-                const timeSinceLastBeat = this.audioTime - this.lastBeatTime;
-                this.beatPhase = (timeSinceLastBeat / this.beatInterval) % 1;
+            // Update beat phase
+            if (this.beatInterval > 0 && this.lastBeatTime > 0) {
+                this.beatPhase = ((now - this.lastBeatTime) / this.beatInterval) % 1;
                 this.nextBeatTime = this.lastBeatTime + this.beatInterval;
-                if (this.audioTime > this.nextBeatTime) {
+                if (now > this.nextBeatTime) {
                     this.lastBeatTime = this.nextBeatTime;
                     this.nextBeatTime += this.beatInterval;
                 }
-            },
-
-            scheduleEvent(eventTime, callback, data = {}) {
-                this.scheduledEvents.push({ time: eventTime, callback, data });
-                this.scheduledEvents.sort((a, b) => a.time - b.time);
-            },
-
-            processScheduledEvents() {
-                while (this.scheduledEvents.length > 0) {
-                    const event = this.scheduledEvents[0];
-                    if (this.visualTime >= event.time) {
-                        event.callback(event.data);
-                        this.scheduledEvents.shift();
-                    } else {
-                        break;
-                    }
-                }
-            },
-
-            // EVOLVE COLOR GENOME
-            evolveColorGenome() {
-                const g = this.colorGenome;
-                g.evolution += 0.016;
-
-                const slowNoise = perlin((g.evolution + g.noiseOffset) * 0.02, 3);
-                const mediumNoise = perlin((g.evolution + g.noiseOffset) * 0.1, 2);
-                const fastNoise = perlin((g.evolution + g.noiseOffset) * 0.5, 2);
-
-                g.hueDrift += slowNoise * 0.5;
-                g.hueGene = (g.hueGene + g.hueDrift + mediumNoise * 2) % 360;
-                g.saturationDrift += mediumNoise * 0.01;
-                g.saturationGene = Math.max(0.6, Math.min(1, g.saturationGene + g.saturationDrift * 0.1));
-                g.lightnessDrift += fastNoise * 0.008;
-                g.lightnessGene = Math.max(0.2, Math.min(0.8, g.lightnessGene + g.lightnessDrift * 0.05));
-                g.chromaticStress += mediumNoise * 0.02;
-                g.chromaticStress = Math.max(0, Math.min(1, g.chromaticStress));
-
-                if (Math.random() < g.mutationRate || (this.beat > 0.3 && Math.random() < 0.05)) {
-                    const mutations = [
-                        () => { g.harmonyMode = ['mono', 'duo', 'triad', 'multi', 'bw'][Math.floor(Math.random() * 5)]; },
-                        () => { g.chromaticStress = Math.random(); },
-                        () => { g.saturationGene = Math.random(); },
-                        () => { g.hueGene = Math.random() * 360; },
-                        () => { g.lightnessGene = 0.3 + Math.random() * 0.4; }
-                    ];
-                    mutations[Math.floor(Math.random() * mutations.length)]();
-                }
-
-                if (this.onset > 0.3) g.chromaticStress = Math.min(1, g.chromaticStress + this.onset * 0.5);
-                if (this.bass > 0.7) g.lightnessGene = Math.max(0.2, g.lightnessGene - this.bass * 0.1);
-            },
-
-            getColorFromGenome(variation = 0, energyMod = 1) {
-                const g = this.colorGenome;
-                let h, s, l;
-                switch(g.harmonyMode) {
-                    case 'mono': h = g.hueGene; s = g.saturationGene * 100; l = (g.lightnessGene + variation * 0.1) * 100; break;
-                    case 'duo': h = variation > 0 ? g.hueGene : (g.hueGene + 180) % 360; s = g.saturationGene * 100; l = g.lightnessGene * 100; break;
-                    case 'triad': { const ts = Math.floor(variation * 3) * 120; h = (g.hueGene + ts) % 360; s = g.saturationGene * 100; l = g.lightnessGene * 100; break; }
-                    case 'bw': h = 0; s = 0; l = (g.lightnessGene + variation * 0.2) * 100; break;
-                    default: h = (g.hueGene + variation * 50) % 360; s = (g.saturationGene * 0.7 + 0.3) * 100; l = g.lightnessGene * 100; break;
-                }
-                s = s * g.chromaticStress;
-                l = Math.max(20, Math.min(80, l + energyMod * 15));
-                return { h, s, l };
-            },
-
-            // =============================================
-            // IMAGE SYSTEM
-            // =============================================
-            initImageSystem() {
-                const img = this.imageSystem;
-                img.imageCanvas = document.createElement('canvas');
-                img.imageCtx = img.imageCanvas.getContext('2d', { willReadFrequently: true });
-                img.imageCanvas.width = 320;
-                img.imageCanvas.height = 240;
-                img.imageWidth = 320;
-                img.imageHeight = 240;
-            },
-
-            async fetchRandomImage() {
-                const img = this.imageSystem;
-                try {
-                    const url = `https://picsum.photos/320/240?random=${Math.random()}`;
-                    const image = new Image();
-                    image.crossOrigin = 'anonymous';
-
-                    image.onload = () => {
-                        // Store as prefetch - don't apply yet
-                        img.prefetchedImage = image;
-                        img.prefetchReady = true;
-                    };
-
-                    image.onerror = () => {
-                        console.log('Image load failed - retrying...');
-                        setTimeout(() => this.fetchRandomImage(), 2000);
-                    };
-
-                    image.src = url;
-                } catch (error) {
-                    console.log('Image fetch error:', error);
-                }
-            },
-
-            // Start transition to prefetched image
-            startImageTransition() {
-                const img = this.imageSystem;
-                if (!img.prefetchReady || !img.prefetchedImage) return;
-
-                // Save old attractors for crossfade
-                img.oldAttractors = img.imageAttractors.slice();
-                img.transitioning = true;
-                img.transitionProgress = 0;
-
-                // Apply the prefetched image
-                img.currentImage = img.prefetchedImage;
-                img.prefetchedImage = null;
-                img.prefetchReady = false;
-
-                // Process the new image
-                this.processImage();
-
-                // Immediately prefetch next image
-                this.fetchRandomImage();
-
-                img.lastFetchTime = performance.now();
-                img.beatsSinceChange = 0;
-
-                // Cycle shape mode
-                img.modeChangeCounter++;
-                if (img.modeChangeCounter % 3 === 0) img.shapeMode = 'filled';
-                else if (img.modeChangeCounter % 3 === 1) img.shapeMode = 'lines';
-                else img.shapeMode = 'hybrid';
-            },
-
-            // PROCESS IMAGE: Extract pixel colors + assign targets
-            processImage() {
-                const img = this.imageSystem;
-                if (!img.currentImage) return;
-
-                img.imageCtx.drawImage(img.currentImage, 0, 0, img.imageWidth, img.imageHeight);
-                const imageData = img.imageCtx.getImageData(0, 0, img.imageWidth, img.imageHeight);
-                const pixels = imageData.data;
-
-                img.imageAttractors = [];
-
-                // Sample pixels based on shape mode
-                const sampledPixels = [];
-
-                for (let y = 1; y < img.imageHeight - 1; y += 2) {
-                    for (let x = 1; x < img.imageWidth - 1; x += 2) {
-                        const idx = (y * img.imageWidth + x) * 4;
-                        const r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2];
-                        const brightness = (r + g + b) / 3;
-
-                        if (img.shapeMode === 'filled' || img.shapeMode === 'hybrid') {
-                            if (brightness < 140) {
-                                sampledPixels.push({ x, y, r, g, b, brightness, type: 'interior' });
-                            }
-                        }
-
-                        if (img.shapeMode === 'lines' || img.shapeMode === 'hybrid') {
-                            const right = ((y * img.imageWidth + (x + 1)) * 4);
-                            const down = (((y + 1) * img.imageWidth + x) * 4);
-                            const rightBr = (pixels[right] + pixels[right + 1] + pixels[right + 2]) / 3;
-                            const downBr = (pixels[down] + pixels[down + 1] + pixels[down + 2]) / 3;
-                            const gradient = Math.abs(brightness - rightBr) + Math.abs(brightness - downBr);
-                            if (gradient > 25) {
-                                sampledPixels.push({ x, y, r, g, b, brightness, type: 'edge' });
-                            }
-                        }
-                    }
-                }
-
-                // If too few dark pixels, sample ALL pixels (bright images like sky/snow)
-                if (sampledPixels.length < agents.length / 2) {
-                    for (let y = 0; y < img.imageHeight; y += 3) {
-                        for (let x = 0; x < img.imageWidth; x += 3) {
-                            const idx = (y * img.imageWidth + x) * 4;
-                            sampledPixels.push({
-                                x, y,
-                                r: pixels[idx], g: pixels[idx + 1], b: pixels[idx + 2],
-                                brightness: (pixels[idx] + pixels[idx + 1] + pixels[idx + 2]) / 3,
-                                type: 'all'
-                            });
-                        }
-                    }
-                }
-
-                // Subsample to match particle count
-                const targetCount = Math.min(agents.length, sampledPixels.length);
-                const sampleRate = Math.max(1, Math.floor(sampledPixels.length / targetCount));
-
-                for (let i = 0; i < sampledPixels.length && img.imageAttractors.length < targetCount; i += sampleRate) {
-                    const p = sampledPixels[i];
-                    const screenX = (p.x / img.imageWidth) * W;
-                    const screenY = (p.y / img.imageHeight) * H;
-
-                    img.imageAttractors.push({
-                        x: screenX,
-                        y: screenY,
-                        r: p.r, g: p.g, b: p.b,
-                        strength: 1,
-                        type: p.type
-                    });
-                }
-
-                // Shuffle & assign particles 1:1
-                const shuffled = [...img.imageAttractors].sort(() => Math.random() - 0.5);
-                agents.forEach((agent, i) => {
-                    const attractor = shuffled[i % shuffled.length];
-                    agent.targetX = attractor.x;
-                    agent.targetY = attractor.y;
-                    agent.targetR = attractor.r;
-                    agent.targetG = attractor.g;
-                    agent.targetB = attractor.b;
-                });
-
-                img.imageReady = true;
-                img.morphProgress = 0;
-            },
-
-            // UPDATE IMAGE SYSTEM - smart timing
-            updateImageSystem() {
-                const img = this.imageSystem;
-
-                const timeSinceLastFetch = performance.now() - img.lastFetchTime;
-
-                // Prefetch first image immediately
-                if (img.lastFetchTime === 0) {
-                    this.fetchRandomImage();
-                    img.lastFetchTime = performance.now();
-                    return;
-                }
-
-                // When prefetch is ready and enough time has passed: transition
-                const minTime = 8000; // 8 sec minimum
-                const maxTime = 12000; // 12 sec maximum
-
-                let shouldChange = false;
-
-                if (timeSinceLastFetch > maxTime && img.prefetchReady) {
-                    shouldChange = true;
-                } else if (timeSinceLastFetch > minTime && img.prefetchReady) {
-                    // Try to sync with beat
-                    if (this.beatConfidence > 0.5 && this.beatPhase < 0.08) {
-                        shouldChange = true;
-                    } else if (this.beatConfidence <= 0.5) {
-                        shouldChange = true;
-                    }
-                }
-
-                if (shouldChange) {
-                    this.startImageTransition();
-                }
-
-                // Transition animation
-                if (img.transitioning) {
-                    img.transitionProgress += 0.02;
-                    if (img.transitionProgress >= 1) {
-                        img.transitioning = false;
-                        img.transitionProgress = 1;
-                    }
-                }
-
-                // Morph progress
-                if (img.imageReady && img.morphProgress < 1) {
-                    img.morphProgress = Math.min(1, img.morphProgress + 0.012);
-                }
-
-                // Flow field between transitions
-                this.flowField.active = img.transitioning || img.morphProgress < 0.3;
-                if (this.flowField.active) {
-                    this.flowField.time += 0.01;
-                }
-            },
-
-            updateAttractors() {
-                const spawnRate = this.audioActive ? 0.03 + this.beat * 0.1 : 0.02;
-                if (Math.random() < spawnRate && this.attractors.length < 8) {
-                    this.attractors.push({
-                        x: CX + (Math.random() - 0.5) * W * 0.8,
-                        y: CY + (Math.random() - 0.5) * H * 0.8,
-                        vx: (Math.random() - 0.5) * 2,
-                        vy: (Math.random() - 0.5) * 2,
-                        strength: (Math.random() - 0.5) * 3,
-                        life: 100 + Math.random() * 300,
-                        radius: 80 + Math.random() * 150,
-                        type: Math.random() < 0.3 ? 'strange' : 'normal',
-                        phase: Math.random() * Math.PI * 2
-                    });
-                }
-
-                this.attractors = this.attractors.filter(a => {
-                    a.life--;
-                    a.x += a.vx + (Math.random() - 0.5) * (1 + this.high * 3);
-                    a.y += a.vy + (Math.random() - 0.5) * (1 + this.high * 3);
-                    if (a.type === 'strange') {
-                        a.phase += 0.05;
-                        a.x += Math.sin(a.phase) * 2;
-                        a.y += Math.cos(a.phase) * 2;
-                    }
-                    return a.life > 0;
-                });
-
-                if (Math.random() < 0.01 && this.zones.length < 3) {
-                    this.zones.push({
-                        x: Math.random() * W, y: Math.random() * H,
-                        radius: 100 + Math.random() * 200,
-                        strength: (Math.random() - 0.5) * 2,
-                        life: 200, hot: Math.random() < 0.5
-                    });
-                }
-                this.zones = this.zones.filter(z => { z.life--; z.radius += (Math.random() - 0.5) * 5; return z.life > 0; });
-            },
-
-            analyzeAudio() {
-                if (!this.audioActive || !this.analyser) return;
-
-                this.analyser.getByteFrequencyData(this.dataArray);
-                const nyquist = this.audioContext.sampleRate / 2;
-                const binWidth = nyquist / this.bufferLength;
-
-                let bassSum = 0, midSum = 0, highSum = 0;
-                let bassCount = 0, midCount = 0, highCount = 0;
-
-                for (let i = 0; i < this.bufferLength; i++) {
-                    const freq = i * binWidth;
-                    if (freq < 250) { bassSum += this.dataArray[i]; bassCount++; }
-                    else if (freq < 2000) { midSum += this.dataArray[i]; midCount++; }
-                    else { highSum += this.dataArray[i]; highCount++; }
-                }
-
-                this.bass = (bassSum / bassCount / 255) || 0;
-                this.mid = (midSum / midCount / 255) || 0;
-                this.high = (highSum / highCount / 255) || 0;
-
-                let energySum = 0;
-                for (let i = 0; i < this.bufferLength; i++) {
-                    energySum += this.dataArray[i] * this.dataArray[i];
-                }
-                this.energy = Math.sqrt(energySum / this.bufferLength) / 255;
-
-                this.energyHistory.push(this.energy);
-                if (this.energyHistory.length > 4) this.energyHistory.shift();
-                const avgEnergy = this.energyHistory.reduce((a, b) => a + b, 0) / this.energyHistory.length;
-
-                const energyDiff = this.energy - avgEnergy;
-                this.onset = energyDiff > 0 ? energyDiff * 5 : 0;
-
-                const threshold = 1.15 - (this.beatConfidence * 0.1);
-                const beatDetected = this.energy > avgEnergy * threshold;
-                this.beat = beatDetected ? energyDiff * 8 : 0;
-
-                if (beatDetected && this.audioTime - this.lastBeatTime > 0.2) {
-                    this.beatHistory.push(this.audioTime);
-                    if (this.beatHistory.length > 8) this.beatHistory.shift();
-                    this.lastBeatTime = this.audioTime;
-                    this.detectBPM();
-
-                    if (this.beatInterval > 0 && this.beatConfidence > 0.5) {
-                        const nextBeat = this.audioTime + this.beatInterval;
-                        this.scheduleEvent(nextBeat, (data) => {
-                            agents.forEach(a => {
-                                const angle = Math.random() * Math.PI * 2;
-                                const force = data.intensity * 15;
-                                a.vx += Math.cos(angle) * force;
-                                a.vy += Math.sin(angle) * force;
-                            });
-                            for (let i = 0; i < Math.floor(data.intensity * 20); i++) {
-                                sparks.push(new Spark(
-                                    CX + (Math.random() - 0.5) * 200,
-                                    CY + (Math.random() - 0.5) * 200
-                                ));
-                            }
-                        }, { intensity: this.beat });
-                    }
-                }
-
-                // Pitch detection
-                if (this.bufferLength > 0) {
-                    let maxCorr = 0, bestLag = 0;
-                    for (let lag = 20; lag < 200; lag++) {
-                        let corr = 0;
-                        for (let i = 0; i < this.bufferLength - lag; i++) {
-                            corr += this.dataArray[i] * this.dataArray[i + lag];
-                        }
-                        if (corr > maxCorr) { maxCorr = corr; bestLag = lag; }
-                    }
-                    this.pitch = this.audioContext.sampleRate / (bestLag * 2);
-                    this.pitchConfidence = maxCorr / (this.bufferLength * 255 * 255);
-                }
-
-                // Spectral flux
-                if (this.lastDataArray) {
-                    let fluxSum = 0;
-                    for (let i = 0; i < this.bufferLength; i++) {
-                        const diff = this.dataArray[i] - this.lastDataArray[i];
-                        if (diff > 0) fluxSum += diff * diff;
-                    }
-                    this.spectralFlux = Math.sqrt(fluxSum / this.bufferLength) / 255;
-                } else {
-                    this.lastDataArray = new Uint8Array(this.bufferLength);
-                }
-                this.lastDataArray.set(this.dataArray);
-
-                this.chromatic = this.onset * 5;
-                this.bloom = this.beat * 0.5;
-                this.distortion = this.spectralFlux * 3;
-
-                if (this.spectralFlux > 0.25 && Math.random() < 0.3) {
-                    const modes = ['explosion', 'tornado', 'chaos', 'quantum', 'plasma'];
-                    this.mode = modes[Math.floor(Math.random() * modes.length)];
-                }
-
-                if (this.beat > 0.15) {
-                    this.intensity = Math.min(3, this.intensity + this.beat * 6);
-                }
             }
-        };
+        },
 
-        // =============================================
-        // AGENT (PARTICLE)
-        // =============================================
-        class Agent {
-            constructor(x, y, id) {
-                this.x = x; this.y = y;
-                this.vx = (Math.random() - 0.5) * 2;
-                this.vy = (Math.random() - 0.5) * 2;
-                this.ax = 0; this.ay = 0;
-                this.id = id;
-                this.energy = 1;
-                this.phase = Math.random() * Math.PI * 2;
-                this.age = 0;
-                this.colorOffset = Math.random() * 360;
+        _detectBPM() {
+            if (this.beatHistory.length < 4) return;
+            const intervals = [];
+            for (let i = 1; i < this.beatHistory.length; i++)
+                intervals.push(this.beatHistory[i] - this.beatHistory[i - 1]);
+            const valid = intervals.filter(i => i > 0.3 && i < 2.0);
+            if (valid.length < 2) return;
+            const sorted = valid.slice().sort((a, b) => a - b);
+            const median = sorted[Math.floor(sorted.length / 2)];
+            const newBPM = 60 / median;
+            this.bpm = this.bpm === 0 ? newBPM : this.bpm * 0.85 + newBPM * 0.15;
+            this.beatInterval = 60 / this.bpm;
+            const variance = valid.reduce((s, i) => s + Math.abs(i - median), 0) / valid.length;
+            this.beatConfidence = Math.max(0, 1 - variance * 5);
+        }
+    };
 
-                // Image targets (smooth morphing)
-                this.targetX = x;
-                this.targetY = y;
-                this.targetR = 128;
-                this.targetG = 128;
-                this.targetB = 128;
+    // =========================================
+    // IMAGE SYSTEM
+    // =========================================
+    const IMG = {
+        canvas: null, ctx: null,
+        W: 200, H: 150, // Small = fast processing
+        ready: false,
+        morphProgress: 0,
+        lastChangeTime: 0,
+        prefetched: null,
+        prefetchReady: false,
+        attractorCount: 0,
+        transitioning: false,
 
-                // Current display color (interpolated)
-                this.dispR = 128;
-                this.dispG = 128;
-                this.dispB = 128;
+        init() {
+            this.canvas = document.createElement('canvas');
+            this.canvas.width = this.W;
+            this.canvas.height = this.H;
+            this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
+        },
+
+        fetch() {
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = () => { this.prefetched = img; this.prefetchReady = true; };
+            img.onerror = () => setTimeout(() => this.fetch(), 2000);
+            img.src = `https://picsum.photos/${this.W}/${this.H}?random=${Math.random()}`;
+        },
+
+        transition() {
+            if (!this.prefetchReady || !this.prefetched) return;
+
+            // Draw to processing canvas
+            this.ctx.drawImage(this.prefetched, 0, 0, this.W, this.H);
+            const data = this.ctx.getImageData(0, 0, this.W, this.H).data;
+
+            this.prefetched = null;
+            this.prefetchReady = false;
+
+            // Sample ALL pixels evenly to match particle count
+            const totalPixels = this.W * this.H;
+            const step = Math.max(1, Math.floor(totalPixels / particles.length));
+            let pIdx = 0;
+
+            for (let i = 0; i < totalPixels && pIdx < particles.length; i += step) {
+                const x = i % this.W;
+                const y = Math.floor(i / this.W);
+                const di = i * 4;
+
+                const p = particles[pIdx];
+                p.targetX = (x / this.W) * W;
+                p.targetY = (y / this.H) * H;
+                // INSTANT color - no slow interpolation!
+                p.imgR = data[di];
+                p.imgG = data[di + 1];
+                p.imgB = data[di + 2];
+                pIdx++;
             }
 
-            modeForces() {
-                // Suppress mode forces during image formation
-                if (U.imageSystem.imageReady && U.imageSystem.morphProgress < 0.85) return;
+            // Fill remaining particles (if any)
+            while (pIdx < particles.length) {
+                const src = particles[pIdx % Math.max(1, pIdx - 1)];
+                const p = particles[pIdx];
+                p.targetX = src.targetX + (Math.random() - 0.5) * 10;
+                p.targetY = src.targetY + (Math.random() - 0.5) * 10;
+                p.imgR = src.imgR;
+                p.imgG = src.imgG;
+                p.imgB = src.imgB;
+                pIdx++;
+            }
 
-                const dx = CX - this.x, dy = CY - this.y;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                const angle = Math.atan2(dy, dx);
-                const I = U.intensity;
-                const bassMult = 1 + U.bass * 10;
-                const midMult = 1 + U.mid * 8;
-                const highMult = 1 + U.high * 6;
+            this.attractorCount = particles.length;
+            this.ready = true;
+            this.morphProgress = 0;
+            this.lastChangeTime = performance.now();
+            this.transitioning = true;
 
-                switch(U.mode) {
-                    case 'explosion':
-                        this.ax -= dx * 0.004 * I * bassMult;
-                        this.ay -= dy * 0.004 * I * bassMult;
-                        break;
-                    case 'implosion':
-                        this.ax += dx * 0.006 * I * bassMult;
-                        this.ay += dy * 0.006 * I * bassMult;
-                        break;
-                    case 'tornado': {
-                        const tangent = angle + Math.PI / 2;
-                        this.ax += Math.cos(tangent) * 0.4 * I * midMult;
-                        this.ay += Math.sin(tangent) * 0.4 * I * midMult;
-                        break;
-                    }
-                    case 'chaos':
-                        this.ax += (Math.random() - 0.5) * 0.8 * I * highMult;
-                        this.ay += (Math.random() - 0.5) * 0.8 * I * highMult;
-                        break;
-                    case 'waves': {
-                        const waveFreq = 30 / (1 + U.mid * 3);
-                        const wave = Math.sin(dist / waveFreq - U.t / 8) * I;
-                        this.ax += Math.cos(angle) * wave * 0.3 * midMult;
-                        this.ay += Math.sin(angle) * wave * 0.3 * midMult;
-                        break;
-                    }
-                    case 'vortex':
-                        for (let i = 0; i < 4; i++) {
-                            const vAngle = (i / 4) * Math.PI * 2 + U.t / 40;
-                            const vx = CX + Math.cos(vAngle) * 250;
-                            const vy = CY + Math.sin(vAngle) * 250;
-                            const vdx = vx - this.x, vdy = vy - this.y;
-                            const vdist = Math.sqrt(vdx * vdx + vdy * vdy);
-                            const va = Math.atan2(vdy, vdx) + Math.PI / 2;
-                            this.ax += Math.cos(va) * 0.15 * I / (vdist / 100 + 1);
-                            this.ay += Math.sin(va) * 0.15 * I / (vdist / 100 + 1);
-                        }
-                        break;
-                    case 'quantum':
-                        if (Math.random() < 0.005 * I) {
-                            this.x = CX + (Math.random() - 0.5) * W * 0.6;
-                            this.y = CY + (Math.random() - 0.5) * H * 0.6;
-                        }
-                        this.ax += (Math.random() - 0.5) * 0.3 * I;
-                        this.ay += (Math.random() - 0.5) * 0.3 * I;
-                        break;
-                    case 'magnetic': {
-                        const fieldAngle = Math.atan2(this.y - CY, this.x - CX);
-                        const fieldStrength = Math.sin(fieldAngle * 3 + U.t / 20) * 0.2 * I;
-                        this.ax += Math.cos(fieldAngle) * fieldStrength;
-                        this.ay += Math.sin(fieldAngle) * fieldStrength;
-                        break;
-                    }
-                    case 'plasma': {
-                        const plasma = Math.sin(this.x / 50 + U.t / 10) +
-                                      Math.sin(this.y / 50 + U.t / 10) +
-                                      Math.sin((this.x + this.y) / 50 + U.t / 10);
-                        this.ax += Math.cos(plasma) * 0.2 * I;
-                        this.ay += Math.sin(plasma) * 0.2 * I;
-                        break;
-                    }
+            // Prefetch next immediately
+            this.fetch();
+        },
+
+        update() {
+            const elapsed = performance.now() - this.lastChangeTime;
+
+            // First image
+            if (this.lastChangeTime === 0) {
+                this.fetch();
+                this.lastChangeTime = performance.now();
+                return;
+            }
+
+            // Change every 8-12 seconds, beat-synced if possible
+            const minTime = 8000, maxTime = 12000;
+            if (elapsed > maxTime && this.prefetchReady) {
+                this.transition();
+            } else if (elapsed > minTime && this.prefetchReady) {
+                if (A.beatConfidence > 0.5 && A.beatPhase < 0.08) {
+                    this.transition();
+                } else if (!A.active || A.beatConfidence <= 0.5) {
+                    this.transition();
                 }
             }
 
-            attractorInfluence() {
-                if (U.imageSystem.imageReady && U.imageSystem.morphProgress < 0.85) return;
-
-                U.attractors.forEach(a => {
-                    const dx = a.x - this.x, dy = a.y - this.y;
-                    const dist = Math.sqrt(dx * dx + dy * dy);
-                    if (dist < a.radius && dist > 0) {
-                        let force = a.strength * (1 - dist / a.radius);
-                        if (a.type === 'strange') force *= Math.sin(U.t / 10 + a.phase);
-                        this.ax += (dx / dist) * force * 0.15;
-                        this.ay += (dy / dist) * force * 0.15;
-                    }
-                });
+            // Morph progress: 0 -> 1 over ~3 seconds
+            if (this.ready && this.morphProgress < 1) {
+                this.morphProgress = Math.min(1, this.morphProgress + 0.006);
             }
 
-            zoneInfluence() {
-                U.zones.forEach(z => {
-                    const dx = z.x - this.x, dy = z.y - this.y;
-                    const dist = Math.sqrt(dx * dx + dy * dy);
-                    if (dist < z.radius) {
-                        const force = z.strength * (1 - dist / z.radius);
-                        if (z.hot) {
-                            this.ax -= (dx / dist) * force * 0.1;
-                            this.ay -= (dy / dist) * force * 0.1;
-                        } else {
-                            this.ax += (dx / dist) * force * 0.1;
-                            this.ay += (dy / dist) * force * 0.1;
-                        }
-                    }
-                });
-            }
-
-            // SMOOTH IMAGE MORPHING (the core of the new system)
-            imageInfluence() {
-                const img = U.imageSystem;
-                if (!img.imageReady) return;
-
-                const morph = img.morphProgress;
-
-                // === SMOOTH EASE-OUT CUBIC MORPHING ===
-                // pos += (target - pos) * lerpFactor
-                const lerpSpeed = 0.08; // Smooth glide, no teleport
-
-                // Morph position toward target
-                this.x += (this.targetX - this.x) * lerpSpeed * morph;
-                this.y += (this.targetY - this.y) * lerpSpeed * morph;
-
-                // Morph color toward target
-                this.dispR += (this.targetR - this.dispR) * 0.06;
-                this.dispG += (this.targetG - this.dispG) * 0.06;
-                this.dispB += (this.targetB - this.dispB) * 0.06;
-
-                // Dampen velocity during morphing (more damping early)
-                const dampening = 0.85 + (1 - morph) * 0.12; // 0.97 early, 0.85 late
-                this.vx *= dampening;
-                this.vy *= dampening;
-
-                // === AUDIO-REACTIVE WITHIN SHAPE ===
-                if (morph > 0.3) {
-                    // Bass = size pulse (handled in draw)
-
-                    // Mid = gentle vibration around target position
-                    const vibAmount = U.mid * 3;
-                    this.x += (Math.random() - 0.5) * vibAmount;
-                    this.y += (Math.random() - 0.5) * vibAmount;
-
-                    // High = scatter/jitter
-                    if (U.high > 0.3) {
-                        this.x += (Math.random() - 0.5) * U.high * 6;
-                        this.y += (Math.random() - 0.5) * U.high * 6;
-                    }
-
-                    // Beat = flash + small burst (handled in draw for flash)
-                    if (U.beat > 0.3) {
-                        const angle = Math.random() * Math.PI * 2;
-                        this.vx += Math.cos(angle) * U.beat * 3;
-                        this.vy += Math.sin(angle) * U.beat * 3;
-                    }
-                }
-
-                // === FLOW FIELD during transitions ===
-                if (U.flowField.active && morph < 0.5) {
-                    const ff = U.flowField;
-                    const noiseVal = perlin2d(
-                        this.x * ff.scale + ff.time,
-                        this.y * ff.scale + ff.noiseZ
-                    );
-                    const flowAngle = noiseVal * Math.PI * 4;
-
-                    // Audio modulates flow field
-                    const amplitude = ff.strength * (1 + U.bass * 3); // Bass = amplitude
-                    const freqMod = 1 + U.high * 2; // High = noise frequency
-
-                    this.vx += Math.cos(flowAngle) * amplitude * (1 - morph * 2) * freqMod * 0.3;
-                    this.vy += Math.sin(flowAngle) * amplitude * (1 - morph * 2) * freqMod * 0.3;
-                }
-            }
-
-            update() {
-                this.vx += this.ax;
-                this.vy += this.ay;
-
-                const friction = U.mode === 'chaos' ? 0.96 : 0.92;
-                this.vx *= friction;
-                this.vy *= friction;
-
-                const maxSpeed = U.mode === 'explosion' ? 15 : (U.mode === 'quantum' ? 20 : 10);
-                const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-                if (speed > maxSpeed) {
-                    this.vx = (this.vx / speed) * maxSpeed;
-                    this.vy = (this.vy / speed) * maxSpeed;
-                }
-
-                this.x += this.vx;
-                this.y += this.vy;
-
-                // Wrap
-                if (this.x < -20) this.x = W + 20;
-                if (this.x > W + 20) this.x = -20;
-                if (this.y < -20) this.y = H + 20;
-                if (this.y > H + 20) this.y = -20;
-
-                this.ax = 0; this.ay = 0;
-                this.energy = 0.6 + Math.sin(U.t / 25 + this.id / 8) * 0.4;
-                this.age++;
-            }
-
-            draw() {
-                let drawX = this.x;
-                let drawY = this.y;
-
-                // Beat glitch position
-                if (U.beat > 0.2 && Math.random() < U.beat) {
-                    drawX += (Math.random() - 0.5) * U.beat * 15;
-                    drawY += (Math.random() - 0.5) * U.beat * 15;
-                }
-
-                const isImageMode = U.imageSystem.imageReady && U.imageSystem.morphProgress > 0.15;
-
-                if (isImageMode) {
-                    // === IMAGE MODE: Direct pixel colors, solid sprites ===
-                    const r = Math.round(this.dispR);
-                    const g = Math.round(this.dispG);
-                    const b = Math.round(this.dispB);
-
-                    // Bass = particle size pulse
-                    const bassPulse = 1 + U.bass * 1.5;
-                    // Beat = brightness flash
-                    const beatFlash = U.beat > 0.3 ? 40 : 0;
-                    const size = (3 + this.energy * 0.5) * bassPulse;
-
-                    const sprite = getSolidSprite(
-                        size,
-                        Math.min(255, r + beatFlash),
-                        Math.min(255, g + beatFlash),
-                        Math.min(255, b + beatFlash)
-                    );
-                    ctx.drawImage(sprite, drawX - sprite.width / 2, drawY - sprite.height / 2);
-                } else {
-                    // === FREE MODE: Genome colors, glow sprites ===
-                    const dist = Math.hypot(this.x - CX, this.y - CY);
-                    const variation = dist / 2 + this.id * 5 + this.colorOffset;
-                    const color = U.getColorFromGenome(variation, this.energy);
-
-                    // Beat color corruption
-                    if (U.beat > 0.25 && Math.random() < 0.3) {
-                        color.h = Math.random() * 360;
-                        color.s = 80 + Math.random() * 20;
-                    }
-
-                    const size = 2 + this.energy * 1.5 + U.onset * 2;
-                    const [cr, cg, cb] = hslToRgb(color.h, color.s, color.l);
-                    const sprite = getSprite(size * 2.5, cr, cg, cb, this.energy * 0.85);
-                    ctx.drawImage(sprite, drawX - sprite.width / 2, drawY - sprite.height / 2);
-                }
+            // Transition ends after morph completes
+            if (this.transitioning && this.morphProgress > 0.8) {
+                this.transitioning = false;
             }
         }
+    };
 
-        // SPARK PARTICLE
-        class Spark {
-            constructor(x, y) {
-                this.x = x; this.y = y;
-                const angle = Math.random() * Math.PI * 2;
-                const speed = 5 + Math.random() * 10;
-                this.vx = Math.cos(angle) * speed;
-                this.vy = Math.sin(angle) * speed;
-                this.life = 1;
-                this.size = 1 + Math.random() * 2;
-                this.colorVariation = Math.random() * 60;
-            }
+    // =========================================
+    // PARTICLE
+    // =========================================
+    const PARTICLE_COUNT = 500;
+    const particles = [];
 
-            update() {
-                this.vx *= 0.95;
-                this.vy *= 0.95;
-                this.x += this.vx;
-                this.y += this.vy;
-                this.life -= 0.02;
-                return this.life > 0;
-            }
-
-            draw() {
-                const color = U.getColorFromGenome(this.colorVariation, this.life);
-                const [r, g, b] = hslToRgb(color.h, color.s, color.l);
-                ctx.globalAlpha = this.life;
-                ctx.fillStyle = `rgb(${r},${g},${b})`;
-                ctx.beginPath();
-                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.globalAlpha = 1;
-            }
-        }
-
-        // =============================================
-        // INITIALIZE
-        // =============================================
-        const agents = [];
-        const sparks = [];
-        const AGENT_COUNT = 500; // Sweet spot: detail + 60fps
-
-        for (let i = 0; i < AGENT_COUNT; i++) {
-            const angle = (i / AGENT_COUNT) * Math.PI * 2;
+    class Particle {
+        constructor(i) {
+            const angle = (i / PARTICLE_COUNT) * Math.PI * 2;
             const r = 100 + Math.random() * 200;
-            agents.push(new Agent(
-                CX + Math.cos(angle) * r,
-                CY + Math.sin(angle) * r,
-                i
-            ));
+            this.x = CX + Math.cos(angle) * r;
+            this.y = CY + Math.sin(angle) * r;
+            this.vx = 0;
+            this.vy = 0;
+            this.id = i;
+
+            // Image target
+            this.targetX = this.x;
+            this.targetY = this.y;
+            this.imgR = 128;
+            this.imgG = 128;
+            this.imgB = 128;
+        }
+    }
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) particles.push(new Particle(i));
+
+    // =========================================
+    // FLOW FIELD STATE
+    // =========================================
+    let flowTime = 0;
+    const FLOW_SCALE = 0.004;
+    const FLOW_Z = Math.random() * 1000;
+
+    // =========================================
+    // MAIN LOOP
+    // =========================================
+    let t = 0, lastTime = performance.now(), fps = 60;
+
+    IMG.init();
+
+    function loop() {
+        const now = performance.now();
+        const dt = now - lastTime;
+        fps = fps * 0.9 + (1000 / dt) * 0.1; // Smoothed FPS
+        lastTime = now;
+        t += 0.016;
+
+        // Audio analysis
+        A.analyze();
+
+        // Image system update
+        IMG.update();
+
+        flowTime += 0.008;
+
+        // How much we're in "image mode"
+        const imgStrength = IMG.ready ? Math.min(1, IMG.morphProgress * 2.5) : 0;
+        // 0 -> free mode, 1 -> fully locked to image
+
+        // ---- CLEAR ----
+        // Stronger clear during image formation for crisp shapes
+        const clearAlpha = imgStrength > 0.3 ? 0.25 : 0.08;
+        ctx.fillStyle = `rgba(0,0,0,${clearAlpha})`;
+        ctx.fillRect(0, 0, W, H);
+
+        // ---- UPDATE & DRAW PARTICLES ----
+        for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+
+            if (imgStrength > 0.1) {
+                // === IMAGE MODE ===
+                // Smooth lerp toward target - STRONG pull
+                const lerpStrength = 0.12 * imgStrength;
+                p.x += (p.targetX - p.x) * lerpStrength;
+                p.y += (p.targetY - p.y) * lerpStrength;
+
+                // Kill velocity during formation
+                p.vx *= 0.7;
+                p.vy *= 0.7;
+
+                // Audio-reactive micro-movement (WITHIN the shape)
+                if (imgStrength > 0.5) {
+                    // Mid = vibration
+                    p.x += (Math.random() - 0.5) * A.mid * 2.5;
+                    p.y += (Math.random() - 0.5) * A.mid * 2.5;
+
+                    // High = scatter
+                    if (A.high > 0.2) {
+                        p.x += (Math.random() - 0.5) * A.high * 4;
+                        p.y += (Math.random() - 0.5) * A.high * 4;
+                    }
+
+                    // Beat = small burst
+                    if (A.beat > 0.3) {
+                        const ba = Math.random() * 6.28;
+                        p.vx += Math.cos(ba) * A.beat * 2;
+                        p.vy += Math.sin(ba) * A.beat * 2;
+                    }
+                }
+
+                // Flow field during transitions
+                if (IMG.transitioning) {
+                    const n = perlin2d(p.x * FLOW_SCALE + flowTime, p.y * FLOW_SCALE + FLOW_Z);
+                    const fAngle = n * 12.56; // 4*PI
+                    const amp = 1.5 * (1 + A.bass * 2) * (1 - imgStrength);
+                    p.vx += Math.cos(fAngle) * amp;
+                    p.vy += Math.sin(fAngle) * amp;
+                }
+
+            } else {
+                // === FREE MODE ===
+                // Flow field always active in free mode
+                const n = perlin2d(p.x * FLOW_SCALE + flowTime, p.y * FLOW_SCALE + FLOW_Z);
+                const fAngle = n * 12.56;
+                const amp = 1.5 + A.bass * 4;
+                p.vx += Math.cos(fAngle) * amp * 0.15;
+                p.vy += Math.sin(fAngle) * amp * 0.15;
+
+                // Center gravity
+                const dx = CX - p.x, dy = CY - p.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist > 50) {
+                    p.vx += (dx / dist) * 0.15;
+                    p.vy += (dy / dist) * 0.15;
+                }
+
+                // Audio energy
+                if (A.beat > 0.2) {
+                    const ba = Math.random() * 6.28;
+                    p.vx += Math.cos(ba) * A.beat * 8;
+                    p.vy += Math.sin(ba) * A.beat * 8;
+                }
+            }
+
+            // Physics
+            p.vx *= 0.92;
+            p.vy *= 0.92;
+            const spd = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+            if (spd > 12) { p.vx = (p.vx / spd) * 12; p.vy = (p.vy / spd) * 12; }
+            p.x += p.vx;
+            p.y += p.vy;
+
+            // Wrap
+            if (p.x < -10) p.x = W + 10;
+            if (p.x > W + 10) p.x = -10;
+            if (p.y < -10) p.y = H + 10;
+            if (p.y > H + 10) p.y = -10;
+
+            // ---- DRAW ----
+            // Bass = size pulse
+            const basePulse = 1 + A.bass * 0.8;
+            const beatFlash = A.beat > 0.25 ? 50 : 0;
+
+            if (imgStrength > 0.3) {
+                // IMAGE MODE: Direct pixel color, simple fillRect (FASTEST)
+                const size = (3 + basePulse) * (0.5 + imgStrength * 0.5);
+
+                ctx.fillStyle = `rgb(${Math.min(255, p.imgR + beatFlash)},${Math.min(255, p.imgG + beatFlash)},${Math.min(255, p.imgB + beatFlash)})`;
+                ctx.fillRect(p.x - size, p.y - size, size * 2, size * 2);
+            } else {
+                // FREE MODE: Simple circle, genome-ish colors, NO gradient
+                const hue = (t * 20 + p.id * 0.7 + A.bass * 100) % 360;
+                const sat = 70 + A.energy * 30;
+                const light = 40 + A.energy * 20 + beatFlash * 0.3;
+                const size = 2 + basePulse + A.onset * 1.5;
+
+                ctx.fillStyle = `hsl(${hue},${sat}%,${light}%)`;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, size, 0, 6.28);
+                ctx.fill();
+            }
         }
 
-        // Initialize image system
-        U.initImageSystem();
-        console.log('Image + Flow Field system initialized');
+        // Beat indicator (simple, cheap)
+        if (A.beatPhase > 0 && A.beatConfidence > 0.5) {
+            const ringSize = 30 + A.beatPhase * 80;
+            const ringAlpha = (1 - A.beatPhase) * 0.5;
+            ctx.strokeStyle = `rgba(255,255,255,${ringAlpha})`;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(CX, CY, ringSize, 0, 6.28);
+            ctx.stroke();
+        }
 
-        // =============================================
-        // MAIN LOOP
-        // =============================================
-        function loop() {
-            const now = performance.now();
-            U.fps = Math.round(1000 / (now - U.lastTime));
-            U.lastTime = now;
-            U.t += 0.016;
+        // ---- UI ----
+        document.getElementById('fps').textContent = Math.round(fps);
+        document.getElementById('mode').textContent = imgStrength > 0.3 ? 'IMAGE' : 'FREE';
+        document.getElementById('audio').textContent = A.active ? 'ON' : 'OFF';
+        document.getElementById('count').textContent = PARTICLE_COUNT;
+        document.getElementById('bass').textContent = A.bass.toFixed(2);
+        document.getElementById('mid').textContent = A.mid.toFixed(2);
+        document.getElementById('high').textContent = A.high.toFixed(2);
+        document.getElementById('bpm').textContent = A.bpm > 0 ?
+            A.bpm.toFixed(0) + (A.beatConfidence > 0.7 ? 'ok' : '?') : '-';
+        document.getElementById('phase').textContent = A.beatPhase > 0 ?
+            (A.beatPhase * 100).toFixed(0) + '%' : '-';
+        document.getElementById('imagestate').textContent = IMG.ready ?
+            `${IMG.attractorCount}p ${(IMG.morphProgress * 100).toFixed(0)}%` : 'SCAN';
 
-            // Dual-clock sync
-            U.updateAudioClock();
-            U.updateBeatPhase();
+        requestAnimationFrame(loop);
+    }
 
-            U.updateEntropy();
-            U.analyzeAudio();
-            U.processScheduledEvents();
-            U.evolveColorGenome();
-            U.updateImageSystem();
-            U.updateMode();
-            U.updateAttractors();
+    loop();
 
-            // Legacy hue for beat indicator
-            let hueShift;
-            if (U.audioActive && U.beatConfidence > 0.5) {
-                hueShift = U.beatPhase * 30 + U.onset * 80;
-            } else if (U.audioActive) {
-                hueShift = U.spectralCentroid / 30 + U.beat * 150 + U.onset * 80;
+    // =========================================
+    // AUDIO INIT
+    // =========================================
+    document.getElementById('audioBtn').addEventListener('click', async () => {
+        try {
+            let stream;
+            const choice = confirm('Capturer ONGLET avec audio?\n\nOUI = Onglet (YouTube/Spotify)\nNON = Microphone');
+
+            if (choice && navigator.mediaDevices.getDisplayMedia) {
+                stream = await navigator.mediaDevices.getDisplayMedia({
+                    video: true,
+                    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000 }
+                });
             } else {
-                hueShift = 0.8 + Math.random() * 3;
-            }
-            U.hue = (U.hue + hueShift) % 360;
-
-            // Clear with trail
-            const isImageForming = U.imageSystem.imageReady && U.imageSystem.morphProgress < 0.5;
-            const clearStrength = isImageForming ? 0.12 : 0.05;
-            const trailAlpha = U.beat > 0.3 ? 0.35 : clearStrength;
-            ctx.fillStyle = `rgba(0, 0, 0, ${trailAlpha})`;
-            ctx.fillRect(0, 0, W, H);
-
-            // Random shockwaves
-            if (Math.random() < 0.004) {
-                const shockX = Math.random() * W, shockY = Math.random() * H;
-                agents.forEach(a => {
-                    const dx = a.x - shockX, dy = a.y - shockY;
-                    const dist = Math.sqrt(dx * dx + dy * dy);
-                    if (dist > 0 && dist < 500) {
-                        const force = (500 - dist) / 50;
-                        a.vx += (dx / dist) * force;
-                        a.vy += (dy / dist) * force;
-                    }
+                stream = await navigator.mediaDevices.getUserMedia({
+                    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000 }
                 });
             }
 
-            // Mitosis
-            if (U.mode === 'mitosis' && agents.length < 500 && Math.random() < 0.01) {
-                const parent = agents[Math.floor(Math.random() * agents.length)];
-                agents.push(new Agent(
-                    parent.x + (Math.random() - 0.5) * 20,
-                    parent.y + (Math.random() - 0.5) * 20,
-                    agents.length
-                ));
-            }
+            A.ctx = new (window.AudioContext || window.webkitAudioContext)();
+            A.analyser = A.ctx.createAnalyser();
+            A.analyser.fftSize = 512;
+            A.analyser.smoothingTimeConstant = 0.1;
+            A.ctx.createMediaStreamSource(stream).connect(A.analyser);
+            A.len = A.analyser.frequencyBinCount;
+            A.data = new Uint8Array(A.len);
+            A.active = true;
 
-            // Update agents
-            agents.forEach(a => {
-                a.modeForces();
-                a.attractorInfluence();
-                a.zoneInfluence();
-                a.imageInfluence();
-                a.update();
-            });
-
-            // Connections (SKIP during image formation, use spatial check not O(n^2))
-            const showConnections = !U.imageSystem.imageReady || U.imageSystem.morphProgress > 0.85;
-            if (showConnections) {
-                // Only check every 5th particle, and limit neighbor search
-                for (let i = 0; i < agents.length; i += 5) {
-                    const a = agents[i];
-                    for (let j = i + 1; j < Math.min(i + 20, agents.length); j++) {
-                        const b = agents[j];
-                        const dx = b.x - a.x, dy = b.y - a.y;
-                        const distSq = dx * dx + dy * dy;
-                        if (distSq < 10000) { // 100^2
-                            const dist = Math.sqrt(distSq);
-                            const alpha = (1 - dist / 100) * 0.15;
-                            const color = U.getColorFromGenome(dist, 0.6);
-                            ctx.strokeStyle = `hsla(${color.h}, ${color.s}%, ${color.l}%, ${alpha})`;
-                            ctx.lineWidth = 0.5;
-                            ctx.beginPath();
-                            ctx.moveTo(a.x, a.y);
-                            ctx.lineTo(b.x, b.y);
-                            ctx.stroke();
-                        }
-                    }
-                }
-            }
-
-            // Draw agents
-            agents.forEach(a => a.draw());
-
-            // Beat indicator ring
-            if (U.beatPhase > 0 && U.beatConfidence > 0.5) {
-                const ringPhase = U.beatPhase;
-                const ringSize = 30 + ringPhase * 80;
-                const ringAlpha = (1 - ringPhase) * 0.6;
-
-                ctx.strokeStyle = `hsla(${U.hue}, 100%, 60%, ${ringAlpha})`;
-                ctx.lineWidth = 3;
-                ctx.beginPath();
-                ctx.arc(CX, CY, ringSize, 0, Math.PI * 2);
-                ctx.stroke();
-
-                if (ringPhase < 0.15) {
-                    const hitAlpha = (0.15 - ringPhase) / 0.15;
-                    ctx.fillStyle = `hsla(${U.hue}, 100%, 70%, ${hitAlpha * 0.3})`;
-                    ctx.beginPath();
-                    ctx.arc(CX, CY, 40, 0, Math.PI * 2);
-                    ctx.fill();
-                }
-            }
-
-            // Update & draw sparks
-            for (let i = sparks.length - 1; i >= 0; i--) {
-                if (!sparks[i].update()) {
-                    sparks.splice(i, 1);
-                } else {
-                    sparks[i].draw();
-                }
-            }
-
-            // POST-PROCESSING
-            fxCtx.clearRect(0, 0, W, H);
-
-            // Chromatic aberration
-            if (U.chromatic > 0.1 || U.beat > 0.3) {
-                const shift = Math.max(U.chromatic * 5, U.beat * 15);
-                fxCtx.globalAlpha = 0.4;
-                fxCtx.globalCompositeOperation = 'screen';
-                fxCtx.drawImage(baseCanvas, -shift, 0);
-                fxCtx.drawImage(baseCanvas, shift, 0);
-                if (U.beat > 0.4) {
-                    fxCtx.drawImage(baseCanvas, 0, -shift * 0.5);
-                }
-                fxCtx.globalAlpha = 1;
-                fxCtx.globalCompositeOperation = 'source-over';
-            }
-
-            // Bloom
-            if (U.bloom > 0.1) {
-                fxCtx.globalAlpha = U.bloom * 0.5;
-                fxCtx.filter = `blur(${U.bloom * 10}px)`;
-                fxCtx.globalCompositeOperation = 'screen';
-                fxCtx.drawImage(baseCanvas, 0, 0);
-                fxCtx.filter = 'none';
-                fxCtx.globalAlpha = 1;
-                fxCtx.globalCompositeOperation = 'source-over';
-            }
-
-            // Update UI
-            document.getElementById('fps').textContent = U.fps;
-            document.getElementById('mode').textContent = U.mode.toUpperCase();
-            document.getElementById('audio').textContent = U.audioActive ? 'ON' : 'OFF';
-            document.getElementById('count').textContent = agents.length;
-            document.getElementById('bass').textContent = U.bass.toFixed(2);
-            document.getElementById('mid').textContent = U.mid.toFixed(2);
-            document.getElementById('high').textContent = U.high.toFixed(2);
-            document.getElementById('pitch').textContent = U.pitchConfidence > 0.01 ?
-                U.pitch.toFixed(0) + 'Hz' : '-';
-
-            document.getElementById('bpm').textContent = U.bpm > 0 ?
-                U.bpm.toFixed(0) + (U.beatConfidence > 0.7 ? 'ok' : '?') : '-';
-            document.getElementById('phase').textContent = U.beatPhase > 0 ?
-                (U.beatPhase * 100).toFixed(0) + '%' : '-';
-            document.getElementById('latency').textContent = (U.latencyCompensation * 1000).toFixed(0);
-
-            document.getElementById('colormode').textContent = U.colorGenome.harmonyMode.toUpperCase();
-
-            const imgCount = U.imageSystem.imageAttractors.length;
-            const sm = U.imageSystem.shapeMode ? U.imageSystem.shapeMode[0].toUpperCase() : 'F';
-            document.getElementById('imagestate').textContent = U.imageSystem.imageReady ?
-                `${sm}:${imgCount}p ${(U.imageSystem.morphProgress * 100).toFixed(0)}%` : 'SCAN';
-
-            requestAnimationFrame(loop);
+            document.getElementById('audioBtn').textContent = 'AUDIO ON';
+            document.getElementById('audioBtn').style.background = 'rgba(0,255,0,0.5)';
+        } catch (err) {
+            console.error('Audio error:', err);
+            alert('Erreur audio: autorisez micro ou partagez onglet.');
         }
+    });
 
-        loop();
-
-        // =============================================
-        // AUDIO INIT
-        // =============================================
-        document.getElementById('audioBtn').addEventListener('click', async () => {
-            try {
-                let stream;
-                const choice = confirm('Capturer ONGLET avec audio?\n\nOUI = Onglet (YouTube/Spotify)\nNON = Microphone');
-
-                if (choice && navigator.mediaDevices.getDisplayMedia) {
-                    stream = await navigator.mediaDevices.getDisplayMedia({
-                        video: true,
-                        audio: {
-                            echoCancellation: false,
-                            noiseSuppression: false,
-                            autoGainControl: false,
-                            sampleRate: 48000
-                        }
-                    });
-                } else {
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        audio: {
-                            echoCancellation: false,
-                            noiseSuppression: false,
-                            autoGainControl: false,
-                            sampleRate: 48000
-                        }
-                    });
-                }
-
-                U.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                U.analyser = U.audioContext.createAnalyser();
-                U.analyser.fftSize = 512;
-                U.analyser.smoothingTimeConstant = 0;
-
-                const source = U.audioContext.createMediaStreamSource(stream);
-                source.connect(U.analyser);
-
-                U.bufferLength = U.analyser.frequencyBinCount;
-                U.dataArray = new Uint8Array(U.bufferLength);
-                U.audioActive = true;
-
-                document.getElementById('audioBtn').textContent = 'AUDIO ON';
-                document.getElementById('audioBtn').style.background = 'rgba(0,255,0,0.5)';
-
-            } catch (err) {
-                console.error('Audio error:', err);
-                alert('Erreur audio!\n\nAutorisez micro ou partagez onglet avec audio.');
+    // Mouse click = explosion
+    canvas.addEventListener('click', (e) => {
+        for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            const dx = e.clientX - p.x, dy = e.clientY - p.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 300 && dist > 0) {
+                p.vx += (dx / dist) * 6;
+                p.vy += (dy / dist) * 6;
             }
-        });
+        }
+    });
 
-        // Mouse interaction
-        baseCanvas.addEventListener('click', (e) => {
-            const force = 8;
-            agents.forEach(a => {
-                const dx = e.clientX - a.x, dy = e.clientY - a.y;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                if (dist < 250 && dist > 0) {
-                    a.vx += (dx / dist) * force;
-                    a.vy += (dy / dist) * force;
-                }
+    // Keyboard
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'i' || e.key === 'I') {
+            IMG.prefetchReady = false;
+            IMG.fetch();
+            const iv = setInterval(() => {
+                if (IMG.prefetchReady) { clearInterval(iv); IMG.transition(); }
+            }, 100);
+        } else if (e.key === 'r' || e.key === 'R') {
+            // Scatter all particles
+            particles.forEach(p => {
+                p.x = Math.random() * W;
+                p.y = Math.random() * H;
+                p.vx = (Math.random() - 0.5) * 10;
+                p.vy = (Math.random() - 0.5) * 10;
             });
-            for (let i = 0; i < 50; i++) {
-                sparks.push(new Spark(e.clientX, e.clientY));
-            }
-        });
-
-        // Keyboard controls
-        window.addEventListener('keydown', (e) => {
-            if (e.key === 'ArrowUp') {
-                U.latencyCompensation += 0.005;
-                console.log(`Latency: ${(U.latencyCompensation * 1000).toFixed(0)}ms`);
-            } else if (e.key === 'ArrowDown') {
-                U.latencyCompensation = Math.max(0, U.latencyCompensation - 0.005);
-                console.log(`Latency: ${(U.latencyCompensation * 1000).toFixed(0)}ms`);
-            } else if (e.key === 'r' || e.key === 'R') {
-                U.latencyCompensation = 0.035;
-                console.log('Latency reset to 35ms');
-            } else if (e.key === 'i' || e.key === 'I') {
-                // Force new image
-                U.imageSystem.prefetchReady = false;
-                U.fetchRandomImage();
-                // Auto-apply when ready
-                const checkInterval = setInterval(() => {
-                    if (U.imageSystem.prefetchReady) {
-                        clearInterval(checkInterval);
-                        U.startImageTransition();
-                    }
-                }, 100);
-                console.log('Loading new image...');
-            } else if (e.key === 'm' || e.key === 'M') {
-                const modes = ['mono', 'duo', 'triad', 'multi', 'bw'];
-                U.colorGenome.harmonyMode = modes[Math.floor(Math.random() * modes.length)];
-                console.log(`Color mode: ${U.colorGenome.harmonyMode}`);
-            } else if (e.key === 's' || e.key === 'S') {
-                const shapeModes = ['filled', 'lines', 'hybrid'];
-                const currentIdx = shapeModes.indexOf(U.imageSystem.shapeMode);
-                U.imageSystem.shapeMode = shapeModes[(currentIdx + 1) % 3];
-                console.log(`Shape mode: ${U.imageSystem.shapeMode.toUpperCase()}`);
-                if (U.imageSystem.currentImage) {
-                    U.processImage();
-                }
-            }
-        });
+        }
+    });
     </script>
 </body>
 </html>
