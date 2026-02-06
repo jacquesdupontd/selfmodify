@@ -1,0 +1,1469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ultimate Emergent Life Engine</title>
+    <style>
+        * { margin: 0; padding: 0; overflow: hidden; }
+        body { background: #000; font-family: monospace; }
+        canvas { display: block; position: absolute; }
+        #base { z-index: 1; }
+        #fx { z-index: 2; }
+        #info {
+            position: fixed; top: 10px; left: 10px; color: #0f0; font-size: 9px; z-index: 999;
+            background: rgba(0,0,0,0.7); padding: 6px; border-radius: 3px;
+        }
+        #audioBtn {
+            position: fixed; top: 10px; right: 10px; z-index: 1000; padding: 8px 15px;
+            background: rgba(0,255,0,0.2); border: 1px solid #0f0; color: #0f0;
+            cursor: pointer; border-radius: 4px; font-family: monospace; font-size: 10px;
+        }
+        #help {
+            position: fixed; bottom: 10px; right: 10px; z-index: 999;
+            color: #0f0; font-size: 8px; background: rgba(0,0,0,0.8);
+            padding: 5px 8px; border-radius: 3px; opacity: 0.6;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="base"></canvas>
+    <canvas id="fx"></canvas>
+    <div id="info">
+        <div>FPS: <span id="fps">60</span> | MODE: <span id="mode">INIT</span></div>
+        <div>AUDIO: <span id="audio">OFF</span> | AGENTS: <span id="count">0</span></div>
+        <div style="font-size: 8px">B:<span id="bass">0</span> M:<span id="mid">0</span> H:<span id="high">0</span> P:<span id="pitch">-</span></div>
+        <div style="font-size: 8px; color: #0ff">BPM:<span id="bpm">-</span> 🎯:<span id="phase">-</span> ⚡:<span id="latency">35</span>ms</div>
+        <div style="font-size: 8px; color: #f0f">🧬:<span id="colormode">MULTI</span> 🖼️:<span id="imagestate">-</span></div>
+    </div>
+    <button id="audioBtn">START AUDIO ⚡</button>
+    <div id="help">⬆⬇ Sync | R Reset | F Form | M Color | PROCEDURAL GEOMETRY ⚡</div>
+
+    <script>
+        const baseCanvas = document.getElementById('base');
+        const fxCanvas = document.getElementById('fx');
+        const ctx = baseCanvas.getContext('2d', { alpha: false, desynchronized: true });
+        const fxCtx = fxCanvas.getContext('2d', { alpha: true });
+
+        let W, H, CX, CY;
+        function resize() {
+            W = baseCanvas.width = fxCanvas.width = window.innerWidth;
+            H = baseCanvas.height = fxCanvas.height = window.innerHeight;
+            CX = W / 2; CY = H / 2;
+        }
+        resize();
+        window.addEventListener('resize', resize);
+
+        // UNIVERSE STATE
+        const U = {
+            t: 0, fps: 60, lastTime: performance.now(),
+            hue: 0, mode: 'calm', modeTimer: 0, intensity: 0.5,
+
+            // Audio
+            audioActive: false, audioContext: null, analyser: null,
+            dataArray: null, bufferLength: 0,
+            bass: 0, mid: 0, high: 0, energy: 0, beat: 0,
+            spectralCentroid: 0, spectralFlux: 0, onset: 0,
+            pitch: 0, pitchConfidence: 0,
+            energyHistory: [], lastDataArray: null,
+
+            // 🎯 DUAL-CLOCK SYNC ENGINE
+            audioTime: 0,              // Precise audio clock (seconds)
+            visualTime: 0,             // Visual render time (seconds)
+            latencyCompensation: 0.035, // 35ms lookahead (tunable 20-50ms)
+            syncOffset: 0,             // Dynamic calibration offset
+
+            // 🎵 BPM DETECTION & PHASE-LOCKED LOOP
+            bpm: 0,                    // Detected tempo
+            beatPhase: 0,              // 0-1 position in beat cycle
+            beatInterval: 0,           // Seconds between beats
+            lastBeatTime: 0,           // Audio time of last beat
+            nextBeatTime: 0,           // Predicted next beat
+            beatHistory: [],           // Timestamps for BPM analysis
+            beatConfidence: 0,         // How sure we are of tempo
+            scheduledEvents: [],       // Future events queue
+
+            // Effects
+            chromatic: 0, bloom: 0, distortion: 0,
+
+            // Attractors & zones
+            attractors: [],
+            zones: [],
+
+            // 🧬 ORGANIC COLOR GENOME
+            colorGenome: {
+                hueGene: Math.random() * 360,          // Base hue drift
+                hueDrift: (Math.random() - 0.5) * 2,   // Drift speed
+                saturationGene: 0.9,                   // 0-1 saturation (HIGH for vibrant!)
+                saturationDrift: 0,
+                lightnessGene: 0.5,                     // 0-1 brightness
+                lightnessDrift: 0,
+                harmonyMode: 'multi',                   // mono/duo/triad/multi/bw
+                chromaticStress: 0,                     // 0=BW, 1=saturated
+                mutationRate: 0.001,                    // Probability of sudden change
+                noiseOffset: Math.random() * 1000,      // Perlin noise seed
+                evolution: 0                             // Evolution time counter
+            },
+
+            // 🎨 PROCEDURAL FORMS SYSTEM - Geometric shapes that morph!
+            formSystem: {
+                currentForm: null,                      // Current form name
+                formAttractors: [],                     // Target positions for particles
+                morphProgress: 0,                       // Morph animation progress (0-1)
+                lastChangeTime: 0,                      // Last form change timestamp
+                changeDuration: 5000,                   // Change every 5 seconds
+                formReady: false,
+
+                // Form parameters (randomized each change)
+                centerX: 0,
+                centerY: 0,
+                rotation: 0,
+                scale: 1,
+                audioMod: 0,
+
+                // Color palette for current form
+                palette: {
+                    hue: 0,
+                    satRange: [60, 100],
+                    lightRange: [40, 70]
+                }
+            },
+
+            updateEntropy() {
+                const now = Date.now();
+                this.entropy = (now % 999999 + performance.now() * 17 + this.t * 137.508) % 999999;
+            },
+
+            updateMode() {
+                this.modeTimer++;
+
+                // 🎵 BEAT-LOCKED MODE CHANGES: Only switch on downbeat when music is playing
+                const canChange = this.beatConfidence > 0.5 ?
+                    (this.beatPhase < 0.1 && Math.random() < 0.3) : // On beat
+                    (Math.random() < 0.01 || this.modeTimer > 120 + Math.random() * 100); // Random
+
+                if (canChange) {
+                    this.modeTimer = 0;
+                    const modes = ['calm', 'explosion', 'implosion', 'tornado', 'chaos',
+                                   'waves', 'vortex', 'quantum', 'magnetic', 'mitosis', 'plasma'];
+                    this.mode = modes[Math.floor(Math.random() * modes.length)];
+                }
+
+                if (Math.random() < 0.015) this.intensity = Math.random() * 2.5;
+            },
+
+            // 🎯 DUAL-CLOCK: Update audio time with DYNAMIC latency compensation
+            updateAudioClock() {
+                if (!this.audioActive || !this.audioContext) {
+                    this.audioTime = this.visualTime;
+                    return;
+                }
+
+                // Audio clock is THE truth - visual follows with compensation
+                this.audioTime = this.audioContext.currentTime;
+
+                // 🆕 DYNAMIC LATENCY: Measure browser's actual output latency
+                const browserLatency = this.audioContext.outputLatency || 0;
+                const totalCompensation = browserLatency + this.syncOffset;
+
+                // Visual time runs ahead to compensate for processing lag
+                this.visualTime = this.audioTime + totalCompensation;
+            },
+
+            // 🎵 BPM DETECTION: Analyze beat intervals
+            detectBPM() {
+                if (this.beatHistory.length < 4) return;
+
+                // Calculate intervals between recent beats
+                const intervals = [];
+                for (let i = 1; i < this.beatHistory.length; i++) {
+                    intervals.push(this.beatHistory[i] - this.beatHistory[i - 1]);
+                }
+
+                // Filter outliers (remove intervals outside 300-2000ms / 30-200 BPM)
+                const validIntervals = intervals.filter(i => i > 0.3 && i < 2.0);
+                if (validIntervals.length < 2) return;
+
+                // Calculate median interval (robust against false beats)
+                const sorted = validIntervals.slice().sort((a, b) => a - b);
+                const median = sorted[Math.floor(sorted.length / 2)];
+
+                // Smooth BPM changes
+                const newBPM = 60 / median;
+                this.bpm = this.bpm === 0 ? newBPM : this.bpm * 0.85 + newBPM * 0.15;
+                this.beatInterval = 60 / this.bpm;
+
+                // Calculate confidence based on consistency
+                const variance = validIntervals.reduce((sum, i) => sum + Math.abs(i - median), 0) / validIntervals.length;
+                this.beatConfidence = Math.max(0, 1 - variance * 5);
+            },
+
+            // 🎵 PHASE-LOCKED LOOP: Predict next beat
+            updateBeatPhase() {
+                if (this.beatInterval === 0 || this.lastBeatTime === 0) return;
+
+                // Calculate phase (0-1) within current beat cycle
+                const timeSinceLastBeat = this.audioTime - this.lastBeatTime;
+                this.beatPhase = (timeSinceLastBeat / this.beatInterval) % 1;
+
+                // Predict next beat time
+                this.nextBeatTime = this.lastBeatTime + this.beatInterval;
+
+                // If we're past predicted beat, advance to next cycle
+                if (this.audioTime > this.nextBeatTime) {
+                    this.lastBeatTime = this.nextBeatTime;
+                    this.nextBeatTime += this.beatInterval;
+                }
+            },
+
+            // 🚀 SCHEDULE EVENT: Queue visual event at precise audio time
+            scheduleEvent(eventTime, callback, data = {}) {
+                this.scheduledEvents.push({ time: eventTime, callback, data });
+                // Sort by time (earliest first)
+                this.scheduledEvents.sort((a, b) => a.time - b.time);
+            },
+
+            // ⚡ PROCESS SCHEDULED EVENTS: Trigger when visual time catches up
+            processScheduledEvents() {
+                while (this.scheduledEvents.length > 0) {
+                    const event = this.scheduledEvents[0];
+
+                    // If visual time has reached event time, trigger it
+                    if (this.visualTime >= event.time) {
+                        event.callback(event.data);
+                        this.scheduledEvents.shift();
+                    } else {
+                        break; // Future events wait
+                    }
+                }
+            },
+
+            // 🧬 EVOLVE COLOR GENOME: Organic color consciousness
+            evolveColorGenome() {
+                const g = this.colorGenome;
+                g.evolution += 0.016;
+
+                // Multi-scale Perlin drift (slow organic evolution)
+                const slowNoise = perlin((g.evolution + g.noiseOffset) * 0.02, 3);
+                const mediumNoise = perlin((g.evolution + g.noiseOffset) * 0.1, 2);
+                const fastNoise = perlin((g.evolution + g.noiseOffset) * 0.5, 2);
+
+                // Hue drift (continuous evolution)
+                g.hueDrift += slowNoise * 0.5;
+                g.hueGene = (g.hueGene + g.hueDrift + mediumNoise * 2) % 360;
+
+                // Saturation breathing (KEEP IT HIGH for vibrant colors!)
+                g.saturationDrift += mediumNoise * 0.01;
+                g.saturationGene = Math.max(0.6, Math.min(1, g.saturationGene + g.saturationDrift * 0.1)); // Min 60%!
+
+                // Lightness oscillation
+                g.lightnessDrift += fastNoise * 0.008;
+                g.lightnessGene = Math.max(0.2, Math.min(0.8, g.lightnessGene + g.lightnessDrift * 0.05));
+
+                // Chromatic stress evolution (BW ↔ Color tension)
+                g.chromaticStress += mediumNoise * 0.02;
+                g.chromaticStress = Math.max(0, Math.min(1, g.chromaticStress));
+
+                // 🔥 MUTATIONS: Sudden phase flips
+                if (Math.random() < g.mutationRate || (this.beat > 0.3 && Math.random() < 0.05)) {
+                    const mutations = [
+                        () => { g.harmonyMode = ['mono', 'duo', 'triad', 'multi', 'bw'][Math.floor(Math.random() * 5)]; },
+                        () => { g.chromaticStress = Math.random(); },
+                        () => { g.saturationGene = Math.random(); },
+                        () => { g.hueGene = Math.random() * 360; },
+                        () => { g.lightnessGene = 0.3 + Math.random() * 0.4; }
+                    ];
+                    mutations[Math.floor(Math.random() * mutations.length)]();
+                }
+
+                // Audio-reactive DNA damage
+                if (this.onset > 0.3) {
+                    g.chromaticStress = Math.min(1, g.chromaticStress + this.onset * 0.5);
+                }
+                if (this.bass > 0.7) {
+                    g.lightnessGene = Math.max(0.2, g.lightnessGene - this.bass * 0.1);
+                }
+            },
+
+            // 🎨 GET COLOR FROM GENOME: Generate colors based on evolved DNA
+            getColorFromGenome(variation = 0, energyMod = 1) {
+                const g = this.colorGenome;
+                let h, s, l;
+
+                switch(g.harmonyMode) {
+                    case 'mono':
+                        h = g.hueGene;
+                        s = g.saturationGene * 100;
+                        l = (g.lightnessGene + variation * 0.1) * 100;
+                        break;
+
+                    case 'duo':
+                        h = variation > 0 ? g.hueGene : (g.hueGene + 180) % 360;
+                        s = g.saturationGene * 100;
+                        l = g.lightnessGene * 100;
+                        break;
+
+                    case 'triad':
+                        const triadShift = Math.floor(variation * 3) * 120;
+                        h = (g.hueGene + triadShift) % 360;
+                        s = g.saturationGene * 100;
+                        l = g.lightnessGene * 100;
+                        break;
+
+                    case 'bw':
+                        h = 0;
+                        s = 0;
+                        l = (g.lightnessGene + variation * 0.2) * 100;
+                        break;
+
+                    case 'multi':
+                    default:
+                        h = (g.hueGene + variation * 50) % 360;
+                        s = (g.saturationGene * 0.7 + 0.3) * 100;
+                        l = g.lightnessGene * 100;
+                        break;
+                }
+
+                // Apply chromatic stress (desaturate when stress low)
+                s = s * g.chromaticStress;
+
+                // Energy modulation
+                l = Math.max(20, Math.min(80, l + energyMod * 15));
+
+                return { h, s, l };
+            },
+
+            // 🎨 FORM GENERATORS - Create geometric patterns
+            generateSpiral(count) {
+                const points = [];
+                const turns = 3 + Math.random() * 2; // 3-5 turns
+                for (let i = 0; i < count; i++) {
+                    const t = (i / count) * turns * Math.PI * 2;
+                    const r = (i / count) * 300 * this.formSystem.scale;
+                    points.push({
+                        x: this.formSystem.centerX + Math.cos(t + this.formSystem.rotation) * r,
+                        y: this.formSystem.centerY + Math.sin(t + this.formSystem.rotation) * r
+                    });
+                }
+                return points;
+            },
+
+            generateGrid(count) {
+                const points = [];
+                const gridSize = Math.ceil(Math.sqrt(count));
+                const spacing = 600 * this.formSystem.scale / gridSize;
+                for (let i = 0; i < count; i++) {
+                    const row = Math.floor(i / gridSize);
+                    const col = i % gridSize;
+                    const x = col * spacing - (gridSize * spacing) / 2;
+                    const y = row * spacing - (gridSize * spacing) / 2;
+                    // Rotate
+                    const rx = x * Math.cos(this.formSystem.rotation) - y * Math.sin(this.formSystem.rotation);
+                    const ry = x * Math.sin(this.formSystem.rotation) + y * Math.cos(this.formSystem.rotation);
+                    points.push({
+                        x: this.formSystem.centerX + rx,
+                        y: this.formSystem.centerY + ry
+                    });
+                }
+                return points;
+            },
+
+            generateCircles(count) {
+                const points = [];
+                const rings = 5 + Math.floor(Math.random() * 3); // 5-7 rings
+                for (let i = 0; i < count; i++) {
+                    const ring = Math.floor((i / count) * rings);
+                    const angleStep = (Math.PI * 2) / Math.max(1, Math.floor(count / rings));
+                    const angle = (i % Math.floor(count / rings)) * angleStep + this.formSystem.rotation;
+                    const radius = ((ring + 1) / rings) * 350 * this.formSystem.scale;
+                    points.push({
+                        x: this.formSystem.centerX + Math.cos(angle) * radius,
+                        y: this.formSystem.centerY + Math.sin(angle) * radius
+                    });
+                }
+                return points;
+            },
+
+            generateWave(count) {
+                const points = [];
+                const waves = 3;
+                const width = 800 * this.formSystem.scale;
+                const height = 200 * this.formSystem.scale;
+                for (let i = 0; i < count; i++) {
+                    const x = (i / count) * width - width / 2;
+                    const y = Math.sin((i / count) * Math.PI * 2 * waves + this.formSystem.rotation) * height;
+                    // Rotate around center
+                    const rx = x * Math.cos(this.formSystem.rotation) - y * Math.sin(this.formSystem.rotation);
+                    const ry = x * Math.sin(this.formSystem.rotation) + y * Math.cos(this.formSystem.rotation);
+                    points.push({
+                        x: this.formSystem.centerX + rx,
+                        y: this.formSystem.centerY + ry
+                    });
+                }
+                return points;
+            },
+
+            generateStar(count) {
+                const points = [];
+                const spikes = 5 + Math.floor(Math.random() * 3); // 5-7 spikes
+                const outerRadius = 300 * this.formSystem.scale;
+                const innerRadius = 150 * this.formSystem.scale;
+                for (let i = 0; i < count; i++) {
+                    const angle = (i / count) * Math.PI * 2 + this.formSystem.rotation;
+                    const spike = Math.floor((angle / (Math.PI * 2)) * spikes * 2);
+                    const radius = spike % 2 === 0 ? outerRadius : innerRadius;
+                    points.push({
+                        x: this.formSystem.centerX + Math.cos(angle) * radius,
+                        y: this.formSystem.centerY + Math.sin(angle) * radius
+                    });
+                }
+                return points;
+            },
+
+            generateDNA(count) {
+                const points = [];
+                const height = 600 * this.formSystem.scale;
+                const radius = 100 * this.formSystem.scale;
+                for (let i = 0; i < count; i++) {
+                    const t = (i / count) * Math.PI * 4; // 2 full rotations
+                    const y = (i / count) * height - height / 2;
+                    const strand = i % 2; // Alternate strands
+                    const x = Math.cos(t + strand * Math.PI) * radius;
+                    // Rotate
+                    const rx = x * Math.cos(this.formSystem.rotation) - y * Math.sin(this.formSystem.rotation);
+                    const ry = x * Math.sin(this.formSystem.rotation) + y * Math.cos(this.formSystem.rotation);
+                    points.push({
+                        x: this.formSystem.centerX + rx,
+                        y: this.formSystem.centerY + ry
+                    });
+                }
+                return points;
+            },
+
+            generatePolygon(count) {
+                const points = [];
+                const sides = 3 + Math.floor(Math.random() * 5); // 3-7 sides
+                const radius = 300 * this.formSystem.scale;
+                const pointsPerSide = Math.floor(count / sides);
+                for (let i = 0; i < count; i++) {
+                    const side = Math.floor(i / pointsPerSide);
+                    const t = (i % pointsPerSide) / pointsPerSide;
+                    const angle1 = (side / sides) * Math.PI * 2 + this.formSystem.rotation;
+                    const angle2 = ((side + 1) / sides) * Math.PI * 2 + this.formSystem.rotation;
+                    const x = (Math.cos(angle1) * (1 - t) + Math.cos(angle2) * t) * radius;
+                    const y = (Math.sin(angle1) * (1 - t) + Math.sin(angle2) * t) * radius;
+                    points.push({
+                        x: this.formSystem.centerX + x,
+                        y: this.formSystem.centerY + y
+                    });
+                }
+                return points;
+            },
+
+            generateGalaxy(count) {
+                const points = [];
+                const arms = 3;
+                for (let i = 0; i < count; i++) {
+                    const arm = i % arms;
+                    const t = (i / count) * Math.PI * 4;
+                    const r = (i / count) * 350 * this.formSystem.scale;
+                    const angle = t + (arm * Math.PI * 2 / arms) + this.formSystem.rotation;
+                    const scatter = (Math.random() - 0.5) * 30;
+                    points.push({
+                        x: this.formSystem.centerX + Math.cos(angle) * r + scatter,
+                        y: this.formSystem.centerY + Math.sin(angle) * r + scatter
+                    });
+                }
+                return points;
+            },
+
+            // 🎨 SELECT RANDOM FORM & GENERATE
+            selectRandomForm() {
+                const form = this.formSystem;
+
+                // 🎨 RANDOM FORM SELECTION
+                const forms = ['spiral', 'grid', 'circles', 'wave', 'star', 'dna', 'polygon', 'galaxy'];
+                form.currentForm = forms[Math.floor(Math.random() * forms.length)];
+
+                // 🎲 RANDOMIZE PARAMETERS
+                form.centerX = CX + (Math.random() - 0.5) * 300; // Off-center!
+                form.centerY = CY + (Math.random() - 0.5) * 300;
+                form.rotation = Math.random() * Math.PI * 2;
+                form.scale = 0.6 + Math.random() * 0.6; // 0.6-1.2
+
+                // 🌈 FORM-SPECIFIC COLOR PALETTES
+                const palettes = {
+                    spiral: { hue: 280, satRange: [70, 95], lightRange: [45, 75] },      // Purple/violet
+                    grid: { hue: 120, satRange: [60, 90], lightRange: [40, 70] },        // Green
+                    circles: { hue: 200, satRange: [65, 95], lightRange: [50, 80] },     // Cyan/blue
+                    wave: { hue: 180, satRange: [70, 100], lightRange: [45, 75] },       // Aqua
+                    star: { hue: 40, satRange: [75, 100], lightRange: [55, 85] },        // Gold/yellow
+                    dna: { hue: 330, satRange: [65, 90], lightRange: [50, 75] },         // Pink/magenta
+                    polygon: { hue: 20, satRange: [70, 95], lightRange: [50, 80] },      // Orange/red
+                    galaxy: { hue: 260, satRange: [60, 85], lightRange: [35, 65] }       // Deep purple
+                };
+
+                form.palette = palettes[form.currentForm];
+
+                // Generate target positions
+                this.generateFormPositions();
+
+                form.formReady = true;
+                form.morphProgress = 0;
+                form.lastChangeTime = performance.now();
+
+                console.log(`🎨 Form: ${form.currentForm.toUpperCase()} | Center: (${form.centerX.toFixed(0)}, ${form.centerY.toFixed(0)}) | Rotation: ${(form.rotation * 180 / Math.PI).toFixed(0)}°`);
+            },
+
+            // 🎯 GENERATE FORM POSITIONS & ASSIGN TO PARTICLES
+            generateFormPositions() {
+                const form = this.formSystem;
+
+                // 🎯 CALL APPROPRIATE GENERATOR based on form type
+                let positions = [];
+                switch(form.currentForm) {
+                    case 'spiral': positions = this.generateSpiral(agents.length); break;
+                    case 'grid': positions = this.generateGrid(agents.length); break;
+                    case 'circles': positions = this.generateCircles(agents.length); break;
+                    case 'wave': positions = this.generateWave(agents.length); break;
+                    case 'star': positions = this.generateStar(agents.length); break;
+                    case 'dna': positions = this.generateDNA(agents.length); break;
+                    case 'polygon': positions = this.generatePolygon(agents.length); break;
+                    case 'galaxy': positions = this.generateGalaxy(agents.length); break;
+                }
+
+                // Convert positions to attractors
+                form.formAttractors = positions.map((pos, i) => {
+                    // Generate color based on form palette
+                    const palette = form.palette;
+                    const hueVariation = (Math.random() - 0.5) * 30; // ±15° variation
+                    const saturation = palette.satRange[0] + Math.random() * (palette.satRange[1] - palette.satRange[0]);
+                    const lightness = palette.lightRange[0] + Math.random() * (palette.lightRange[1] - palette.lightRange[0]);
+
+                    return {
+                        x: pos.x,
+                        y: pos.y,
+                        color: {
+                            h: (palette.hue + hueVariation + 360) % 360,
+                            s: saturation,
+                            l: lightness
+                        }
+                    };
+                });
+
+                // 🎯 ASSIGN particles to target positions (1:1 mapping)
+                agents.forEach((agent, i) => {
+                    const attractor = form.formAttractors[i % form.formAttractors.length];
+                    agent.assignedAttractor = attractor;
+                    agent.imageColorHint = attractor.color; // Use form color!
+                });
+
+                console.log(`✨ Generated ${form.formAttractors.length} targets for ${form.currentForm}`);
+            },
+
+            // 🔍 SOBEL EDGE DETECTION
+            sobelEdgeDetection(pixels, width, height) {
+                const edges = new Uint8Array(width * height);
+
+                // Sobel kernels
+                const sobelX = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
+                const sobelY = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+
+                for (let y = 1; y < height - 1; y++) {
+                    for (let x = 1; x < width - 1; x++) {
+                        let gx = 0, gy = 0;
+
+                        // Apply kernels
+                        for (let ky = -1; ky <= 1; ky++) {
+                            for (let kx = -1; kx <= 1; kx++) {
+                                const idx = ((y + ky) * width + (x + kx)) * 4;
+                                const gray = (pixels[idx] + pixels[idx + 1] + pixels[idx + 2]) / 3;
+                                const kernelIdx = (ky + 1) * 3 + (kx + 1);
+
+                                gx += gray * sobelX[kernelIdx];
+                                gy += gray * sobelY[kernelIdx];
+                            }
+                        }
+
+                        const magnitude = Math.sqrt(gx * gx + gy * gy);
+                        edges[y * width + x] = Math.min(255, magnitude);
+                    }
+                }
+
+                return edges;
+            },
+
+            // 🎨 EXTRACT DOMINANT COLORS (simplified K-means)
+            extractDominantColors(pixels, k = 5) {
+                const colors = [];
+                const sampleSize = 1000;
+
+                // Sample random pixels
+                for (let i = 0; i < sampleSize; i++) {
+                    const idx = Math.floor(Math.random() * (pixels.length / 4)) * 4;
+                    colors.push({
+                        r: pixels[idx],
+                        g: pixels[idx + 1],
+                        b: pixels[idx + 2]
+                    });
+                }
+
+                // Simple clustering (just take spread samples for now)
+                const clusters = [];
+                for (let i = 0; i < k; i++) {
+                    const sample = colors[Math.floor((i / k) * colors.length)];
+                    clusters.push(sample);
+                }
+
+                return clusters;
+            },
+
+            // 🌊 UPDATE FORM SYSTEM (5 SECOND CHANGES!)
+            updateFormSystem() {
+                const form = this.formSystem;
+
+                // ⏰ Change form every 5 seconds
+                const timeSinceLastChange = performance.now() - form.lastChangeTime;
+                if (timeSinceLastChange > form.changeDuration || form.lastChangeTime === 0) {
+                    this.selectRandomForm();
+                }
+
+                // Smooth morph animation
+                if (form.formReady && form.morphProgress < 1) {
+                    form.morphProgress = Math.min(1, form.morphProgress + 0.02); // Smooth transition
+                }
+            },
+
+            updateAttractors() {
+                // Spawn attractors
+                const spawnRate = this.audioActive ? 0.03 + this.beat * 0.1 : 0.02;
+                if (Math.random() < spawnRate && this.attractors.length < 8) {
+                    const type = Math.random() < 0.3 ? 'strange' : 'normal';
+                    this.attractors.push({
+                        x: CX + (Math.random() - 0.5) * W * 0.8,
+                        y: CY + (Math.random() - 0.5) * H * 0.8,
+                        vx: (Math.random() - 0.5) * 2,
+                        vy: (Math.random() - 0.5) * 2,
+                        strength: (Math.random() - 0.5) * 3,
+                        life: 100 + Math.random() * 300,
+                        radius: 80 + Math.random() * 150,
+                        type: type,
+                        phase: Math.random() * Math.PI * 2
+                    });
+                }
+
+                this.attractors = this.attractors.filter(a => {
+                    a.life--;
+                    a.x += a.vx + (Math.random() - 0.5) * (1 + this.high * 3);
+                    a.y += a.vy + (Math.random() - 0.5) * (1 + this.high * 3);
+
+                    if (a.type === 'strange') {
+                        a.phase += 0.05;
+                        a.x += Math.sin(a.phase) * 2;
+                        a.y += Math.cos(a.phase) * 2;
+                    }
+
+                    return a.life > 0;
+                });
+
+                // Energy zones
+                if (Math.random() < 0.01 && this.zones.length < 3) {
+                    this.zones.push({
+                        x: Math.random() * W,
+                        y: Math.random() * H,
+                        radius: 100 + Math.random() * 200,
+                        strength: (Math.random() - 0.5) * 2,
+                        life: 200,
+                        hot: Math.random() < 0.5
+                    });
+                }
+
+                this.zones = this.zones.filter(z => {
+                    z.life--;
+                    z.radius += (Math.random() - 0.5) * 5;
+                    return z.life > 0;
+                });
+            },
+
+            analyzeAudio() {
+                if (!this.audioActive || !this.analyser) return;
+
+                this.analyser.getByteFrequencyData(this.dataArray);
+
+                const nyquist = this.audioContext.sampleRate / 2;
+                const binWidth = nyquist / this.bufferLength;
+
+                // Frequency bands
+                let bassSum = 0, midSum = 0, highSum = 0;
+                let bassCount = 0, midCount = 0, highCount = 0;
+
+                for (let i = 0; i < this.bufferLength; i++) {
+                    const freq = i * binWidth;
+                    if (freq < 250) { bassSum += this.dataArray[i]; bassCount++; }
+                    else if (freq < 2000) { midSum += this.dataArray[i]; midCount++; }
+                    else { highSum += this.dataArray[i]; highCount++; }
+                }
+
+                this.bass = (bassSum / bassCount / 255) || 0;
+                this.mid = (midSum / midCount / 255) || 0;
+                this.high = (highSum / highCount / 255) || 0;
+
+                // Energy
+                let energySum = 0;
+                for (let i = 0; i < this.bufferLength; i++) {
+                    energySum += this.dataArray[i] * this.dataArray[i];
+                }
+                this.energy = Math.sqrt(energySum / this.bufferLength) / 255;
+
+                // Beat/onset detection (OPTIMIZED - shorter history for less lag)
+                this.energyHistory.push(this.energy);
+                if (this.energyHistory.length > 4) this.energyHistory.shift(); // Reduced from 8 to 4 frames
+                const avgEnergy = this.energyHistory.reduce((a, b) => a + b, 0) / this.energyHistory.length;
+
+                const energyDiff = this.energy - avgEnergy;
+                this.onset = energyDiff > 0 ? energyDiff * 5 : 0;
+
+                // Adaptive beat threshold
+                const threshold = 1.15 - (this.beatConfidence * 0.1); // Lower threshold when confident in BPM
+                const beatDetected = this.energy > avgEnergy * threshold;
+                this.beat = beatDetected ? energyDiff * 8 : 0;
+
+                // 🎵 BPM TRACKING: Record beat timestamps
+                if (beatDetected && this.audioTime - this.lastBeatTime > 0.2) { // Debounce (200ms min)
+                    this.beatHistory.push(this.audioTime);
+                    if (this.beatHistory.length > 8) this.beatHistory.shift(); // Keep last 8 beats
+
+                    this.lastBeatTime = this.audioTime;
+                    this.detectBPM();
+
+                    // 🚀 SCHEDULE FUTURE VISUAL EVENTS (Predictive sync!)
+                    if (this.beatInterval > 0 && this.beatConfidence > 0.5) {
+                        const nextBeat = this.audioTime + this.beatInterval;
+
+                        // Pre-schedule particle explosion for next beat
+                        this.scheduleEvent(nextBeat, (data) => {
+                            // This fires EXACTLY on the beat in visual time!
+                            agents.forEach(a => {
+                                const angle = Math.random() * Math.PI * 2;
+                                const force = data.intensity * 20;
+                                a.vx += Math.cos(angle) * force;
+                                a.vy += Math.sin(angle) * force;
+                            });
+
+                            // Spawn sparks on beat
+                            for (let i = 0; i < Math.floor(data.intensity * 30); i++) {
+                                sparks.push(new Spark(
+                                    CX + (Math.random() - 0.5) * 200,
+                                    CY + (Math.random() - 0.5) * 200
+                                ));
+                            }
+                        }, { intensity: this.beat });
+                    }
+                }
+
+                // Pitch detection (simplified autocorrelation)
+                if (this.bufferLength > 0) {
+                    let maxCorr = 0, bestLag = 0;
+                    for (let lag = 20; lag < 200; lag++) {
+                        let corr = 0;
+                        for (let i = 0; i < this.bufferLength - lag; i++) {
+                            corr += this.dataArray[i] * this.dataArray[i + lag];
+                        }
+                        if (corr > maxCorr) {
+                            maxCorr = corr;
+                            bestLag = lag;
+                        }
+                    }
+                    this.pitch = this.audioContext.sampleRate / (bestLag * 2);
+                    this.pitchConfidence = maxCorr / (this.bufferLength * 255 * 255);
+                }
+
+                // Spectral flux
+                if (this.lastDataArray) {
+                    let fluxSum = 0;
+                    for (let i = 0; i < this.bufferLength; i++) {
+                        const diff = this.dataArray[i] - this.lastDataArray[i];
+                        if (diff > 0) fluxSum += diff * diff;
+                    }
+                    this.spectralFlux = Math.sqrt(fluxSum / this.bufferLength) / 255;
+                } else {
+                    this.lastDataArray = new Uint8Array(this.bufferLength);
+                }
+                this.lastDataArray.set(this.dataArray);
+
+                // Effects
+                this.chromatic = this.onset * 5;
+                this.bloom = this.beat * 0.5;
+                this.distortion = this.spectralFlux * 3;
+
+                // Auto mode change on flux (now synced to beat phase)
+                if (this.spectralFlux > 0.25 && Math.random() < 0.3) {
+                    const modes = ['explosion', 'tornado', 'chaos', 'quantum', 'plasma'];
+                    this.mode = modes[Math.floor(Math.random() * modes.length)];
+                }
+
+                // Intensity modulation (smoothed to avoid jank)
+                if (this.beat > 0.15) {
+                    this.intensity = Math.min(3, this.intensity + this.beat * 6);
+                }
+
+                // NOTE: Beat explosions now handled by scheduled events (see BPM tracking above)
+                // This eliminates the ~67ms lag from the old immediate-trigger approach!
+            }
+        };
+
+        // Noise
+        function noise(x, y, seed = 0) {
+            const n = Math.sin(x * 12.9898 + y * 78.233 + seed * 45.164) * 43758.5453123;
+            return n - Math.floor(n);
+        }
+
+        // 🌊 PERLIN NOISE (for organic evolution)
+        function perlin(x, octaves = 4) {
+            let value = 0;
+            let amplitude = 1;
+            let frequency = 1;
+            let maxValue = 0;
+
+            for (let i = 0; i < octaves; i++) {
+                const sampleX = x * frequency;
+                const noise = Math.sin(sampleX) * 0.5 + Math.cos(sampleX * 1.3) * 0.5;
+                value += noise * amplitude;
+                maxValue += amplitude;
+                amplitude *= 0.5;
+                frequency *= 2;
+            }
+
+            return value / maxValue; // Normalize to -1 to 1
+        }
+
+        // AGENT
+        class Agent {
+            constructor(x, y, id) {
+                this.x = x; this.y = y;
+                this.vx = (Math.random() - 0.5) * 2;
+                this.vy = (Math.random() - 0.5) * 2;
+                this.ax = 0; this.ay = 0;
+                this.id = id;
+                this.energy = 1;
+                this.phase = Math.random() * Math.PI * 2;
+                this.neighbors = [];
+                this.age = 0;
+                this.imageColorHint = null; // 🎨 Subtle color from image data
+                this.colorOffset = Math.random() * 360; // 🌈 UNIQUE color per particle
+                this.glitchAmount = 0; // 💥 Glitch intensity
+                this.assignedAttractor = null; // 🆕 PARTICLE ASSIGNMENT: Each particle owns ONE attractor
+                this.attractorIndex = -1; // Index in imageAttractors array
+            }
+
+            modeForces() {
+                // 🎨 TOTAL SHUTDOWN when form is active - NO CIRCLES, NO CORNERS!
+                const formProgress = U.formSystem.formReady ? U.formSystem.morphProgress : 0;
+
+                // COMPLETE KILL during form display (not just formation)
+                if (U.formSystem.formReady && formProgress < 0.9) {
+                    return; // EXIT IMMEDIATELY - no mode forces at all!
+                }
+
+                const dx = CX - this.x, dy = CY - this.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                const angle = Math.atan2(dy, dx);
+                const I = U.intensity;
+
+                const bassMult = 1 + U.bass * 10;
+                const midMult = 1 + U.mid * 8;
+                const highMult = 1 + U.high * 6;
+
+                switch(U.mode) {
+                    case 'explosion':
+                        this.ax -= dx * 0.004 * I * bassMult;
+                        this.ay -= dy * 0.004 * I * bassMult;
+                        break;
+                    case 'implosion':
+                        this.ax += dx * 0.006 * I * bassMult;
+                        this.ay += dy * 0.006 * I * bassMult;
+                        break;
+                    case 'tornado':
+                        const tangent = angle + Math.PI / 2;
+                        this.ax += Math.cos(tangent) * 0.4 * I * midMult;
+                        this.ay += Math.sin(tangent) * 0.4 * I * midMult;
+                        break;
+                    case 'chaos':
+                        this.ax += (Math.random() - 0.5) * 0.8 * I * highMult;
+                        this.ay += (Math.random() - 0.5) * 0.8 * I * highMult;
+                        break;
+                    case 'waves':
+                        const waveFreq = 30 / (1 + U.mid * 3);
+                        const wave = Math.sin(dist / waveFreq - U.t / 8) * I;
+                        this.ax += Math.cos(angle) * wave * 0.3 * midMult;
+                        this.ay += Math.sin(angle) * wave * 0.3 * midMult;
+                        break;
+                    case 'vortex':
+                        for (let i = 0; i < 4; i++) {
+                            const vAngle = (i / 4) * Math.PI * 2 + U.t / 40;
+                            const vx = CX + Math.cos(vAngle) * 250;
+                            const vy = CY + Math.sin(vAngle) * 250;
+                            const vdx = vx - this.x, vdy = vy - this.y;
+                            const vdist = Math.sqrt(vdx * vdx + vdy * vdy);
+                            const va = Math.atan2(vdy, vdx) + Math.PI / 2;
+                            this.ax += Math.cos(va) * 0.15 * I / (vdist / 100 + 1);
+                            this.ay += Math.sin(va) * 0.15 * I / (vdist / 100 + 1);
+                        }
+                        break;
+                    case 'quantum':
+                        // Quantum tunneling
+                        if (Math.random() < 0.005 * I) {
+                            this.x = CX + (Math.random() - 0.5) * W * 0.6;
+                            this.y = CY + (Math.random() - 0.5) * H * 0.6;
+                        }
+                        this.ax += (Math.random() - 0.5) * 0.3 * I;
+                        this.ay += (Math.random() - 0.5) * 0.3 * I;
+                        break;
+                    case 'magnetic':
+                        // Field lines
+                        const fieldAngle = Math.atan2(this.y - CY, this.x - CX);
+                        const fieldStrength = Math.sin(fieldAngle * 3 + U.t / 20) * 0.2 * I;
+                        this.ax += Math.cos(fieldAngle) * fieldStrength;
+                        this.ay += Math.sin(fieldAngle) * fieldStrength;
+                        break;
+                    case 'plasma':
+                        const plasma = Math.sin(this.x / 50 + U.t / 10) +
+                                      Math.sin(this.y / 50 + U.t / 10) +
+                                      Math.sin((this.x + this.y) / 50 + U.t / 10);
+                        this.ax += Math.cos(plasma) * 0.2 * I;
+                        this.ay += Math.sin(plasma) * 0.2 * I;
+                        break;
+                }
+            }
+
+            attractorInfluence() {
+                // 🎨 TOTAL KILL when form is active
+                if (U.formSystem.formReady && U.formSystem.morphProgress < 0.9) {
+                    return; // NO random attractors during form display!
+                }
+
+                U.attractors.forEach(a => {
+                    const dx = a.x - this.x, dy = a.y - this.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < a.radius && dist > 0) {
+                        let force = a.strength * (1 - dist / a.radius);
+                        if (a.type === 'strange') {
+                            force *= Math.sin(U.t / 10 + a.phase);
+                        }
+                        this.ax += (dx / dist) * force * 0.15;
+                        this.ay += (dy / dist) * force * 0.15;
+                    }
+                });
+            }
+
+            zoneInfluence() {
+                U.zones.forEach(z => {
+                    const dx = z.x - this.x, dy = z.y - this.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < z.radius) {
+                        const force = z.strength * (1 - dist / z.radius);
+                        if (z.hot) {
+                            // Hot zone - repel
+                            this.ax -= (dx / dist) * force * 0.1;
+                            this.ay -= (dy / dist) * force * 0.1;
+                        } else {
+                            // Cold zone - attract
+                            this.ax += (dx / dist) * force * 0.1;
+                            this.ay += (dy / dist) * force * 0.1;
+                        }
+                    }
+                });
+            }
+
+            // 🌌 IMAGE ATTRACTOR INFLUENCE: PARTICLE ASSIGNMENT - morph to assigned position
+            formInfluence() {
+                const form = U.formSystem;
+                if (!form.formReady || !this.assignedAttractor) return;
+
+                const target = this.assignedAttractor;
+                const dx = target.x - this.x;
+                const dy = target.y - this.y;
+                const dist = Math.hypot(dx, dy);
+
+                if (dist === 0) return;
+
+                // 🎯 SMOOTH PROGRESSIVE MORPHING (no lag!)
+                const progress = form.morphProgress;
+
+                // Smooth force curve: starts gentle, peaks at 50%, eases out
+                const forceCurve = Math.sin(progress * Math.PI); // 0 → 1 → 0
+                const baseForce = 5.0 + forceCurve * 15.0; // 5-20 (no nuclear 80!)
+
+                // Audio-reactive modulation
+                const audioBoost = 1 + U.bass * 0.5 + U.high * 0.3;
+
+                // Apply smooth attraction force
+                this.ax += (dx / dist) * baseForce * audioBoost;
+                this.ay += (dy / dist) * baseForce * audioBoost;
+
+                // Velocity damping - smooth throughout
+                const dampening = 0.92 - progress * 0.15; // 0.92 → 0.77
+                this.vx *= dampening;
+                this.vy *= dampening;
+
+                // 🎨 USE FORM COLOR
+                if (target.color) {
+                    this.imageColorHint = target.color;
+                }
+            }
+
+            update() {
+                this.vx += this.ax;
+                this.vy += this.ay;
+
+                const friction = U.mode === 'chaos' ? 0.96 : 0.92;
+                this.vx *= friction;
+                this.vy *= friction;
+
+                const maxSpeed = U.mode === 'explosion' ? 15 : (U.mode === 'quantum' ? 20 : 10);
+                const speed = Math.sqrt(this.vx ** 2 + this.vy ** 2);
+                if (speed > maxSpeed) {
+                    this.vx = (this.vx / speed) * maxSpeed;
+                    this.vy = (this.vy / speed) * maxSpeed;
+                }
+
+                this.x += this.vx;
+                this.y += this.vy;
+
+                // Wrap
+                if (this.x < 0) this.x = W;
+                if (this.x > W) this.x = 0;
+                if (this.y < 0) this.y = H;
+                if (this.y > H) this.y = 0;
+
+                this.ax = 0; this.ay = 0;
+                this.energy = 0.6 + Math.sin(U.t / 25 + this.id / 8) * 0.4;
+                this.age++;
+            }
+
+            draw() {
+                // 💥 GLITCH POSITION on beats
+                let drawX = this.x;
+                let drawY = this.y;
+                if (U.beat > 0.2 && Math.random() < U.beat) {
+                    drawX += (Math.random() - 0.5) * U.beat * 20;
+                    drawY += (Math.random() - 0.5) * U.beat * 20;
+                }
+
+                const dist = Math.hypot(this.x - CX, this.y - CY);
+
+                let color;
+
+                // 🎨 FORM MODE: Use PURE form colors (NO genome interference!)
+                if (this.imageColorHint && U.formSystem.formReady && U.formSystem.morphProgress > 0.1) {
+                    const hint = this.imageColorHint;
+
+                    // PURE IMAGE COLOR - no blending!
+                    color = {
+                        h: hint.h || 0,
+                        s: hint.s || 0,
+                        l: hint.l || 50
+                    };
+
+                    // Audio-reactive brightness modulation
+                    color.l = Math.max(20, Math.min(80, color.l + U.energy * 15));
+
+                    // Glitch on beats (color shift, not genome)
+                    if (U.beat > 0.3 && Math.random() < 0.2) {
+                        color.h = (color.h + Math.random() * 60 - 30) % 360;
+                    }
+                } else {
+                    // FREE MODE: Use color genome
+                    const variation = dist / 2 + this.id * 5 + this.colorOffset;
+                    color = U.getColorFromGenome(variation, this.energy);
+
+                    // Glitch corruption on beats
+                    if (U.beat > 0.25 && Math.random() < 0.3) {
+                        color.h = Math.random() * 360;
+                        color.s = 80 + Math.random() * 20;
+                    }
+                }
+
+                // 🎯 SIZE: Bigger during morphing for clear shapes
+                const isFormMode = U.formSystem.formReady && U.formSystem.morphProgress < 0.6;
+                const baseSize = isFormMode ? 4 : 2;
+                const size = baseSize + this.energy * 1.5 + U.onset * 2;
+
+                // SIMPLE RENDERING during morphing (no glow = clearer shapes!)
+                if (isFormMode) {
+                    // Solid particles for crisp shapes
+                    ctx.fillStyle = `hsla(${color.h}, ${color.s}%, ${color.l}%, 0.9)`;
+                    ctx.beginPath();
+                    ctx.arc(drawX, drawY, size, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Small bright core
+                    ctx.fillStyle = `hsla(${color.h}, ${Math.min(100, color.s + 20)}%, ${Math.min(95, color.l + 25)}%, 1)`;
+                    ctx.beginPath();
+                    ctx.arc(drawX, drawY, size * 0.4, 0, Math.PI * 2);
+                    ctx.fill();
+                } else {
+                    // Glow mode when free (use glitched position)
+                    const gradient = ctx.createRadialGradient(drawX, drawY, 0, drawX, drawY, size * 3);
+                    gradient.addColorStop(0, `hsla(${color.h}, ${color.s}%, ${color.l + 30}%, 0.95)`);
+                    gradient.addColorStop(0.4, `hsla(${color.h}, ${color.s}%, ${color.l + 10}%, 0.6)`);
+                    gradient.addColorStop(1, `hsla(${color.h}, ${Math.max(0, color.s - 20)}%, ${color.l - 10}%, 0)`);
+
+                    ctx.fillStyle = gradient;
+                    ctx.beginPath();
+                    ctx.arc(drawX, drawY, size * 3, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Core
+                    ctx.fillStyle = `hsla(${color.h}, ${Math.min(100, color.s + 15)}%, ${Math.min(90, color.l + 35)}%, ${this.energy})`;
+                    ctx.beginPath();
+                    ctx.arc(drawX, drawY, size * 0.6, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+        }
+
+        // SPARK PARTICLE
+        class Spark {
+            constructor(x, y) {
+                this.x = x; this.y = y;
+                const angle = Math.random() * Math.PI * 2;
+                const speed = 5 + Math.random() * 10;
+                this.vx = Math.cos(angle) * speed;
+                this.vy = Math.sin(angle) * speed;
+                this.life = 1;
+                this.size = 1 + Math.random() * 2;
+                this.colorVariation = Math.random() * 60; // 🧬 Use for color genome
+            }
+
+            update() {
+                this.vx *= 0.95;
+                this.vy *= 0.95;
+                this.x += this.vx;
+                this.y += this.vy;
+                this.life -= 0.02;
+                return this.life > 0;
+            }
+
+            draw() {
+                // 🧬 USE COLOR GENOME
+                const color = U.getColorFromGenome(this.colorVariation, this.life);
+                ctx.fillStyle = `hsla(${color.h}, ${Math.min(100, color.s + 15)}%, ${Math.min(90, color.l + 20)}%, ${this.life})`;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        // Initialize
+        const agents = [];
+        const sparks = [];
+        const AGENT_COUNT = 800; // Balanced: detail + performance
+
+        for (let i = 0; i < AGENT_COUNT; i++) {
+            const angle = (i / AGENT_COUNT) * Math.PI * 2;
+            const r = 100 + Math.random() * 200;
+            agents.push(new Agent(
+                CX + Math.cos(angle) * r,
+                CY + Math.sin(angle) * r,
+                i
+            ));
+        }
+
+        // 🎨 INITIALIZE FORM SYSTEM
+        console.log('🎨 Procedural Forms System initialized');
+
+        // MAIN LOOP
+        function loop() {
+            const now = performance.now();
+            U.fps = Math.round(1000 / (now - U.lastTime));
+            U.lastTime = now;
+
+            U.t += 0.016;
+
+            // 🎯 DUAL-CLOCK SYNC: Update clocks FIRST (critical timing!)
+            U.updateAudioClock();
+
+            // 🎵 PLL: Update beat phase prediction
+            U.updateBeatPhase();
+
+            U.updateEntropy();
+            U.analyzeAudio();
+
+            // ⚡ PROCESS SCHEDULED EVENTS: Trigger pre-scheduled visual hits
+            U.processScheduledEvents();
+
+            // 🧬 EVOLVE COLOR GENOME: Organic color consciousness
+            U.evolveColorGenome();
+
+            // 🎨 UPDATE FORM SYSTEM: Morphing geometric shapes
+            U.updateFormSystem();
+
+            U.updateMode();
+            U.updateAttractors();
+
+            // Legacy hue (kept for beat indicator, but color genome is primary)
+            let hueShift;
+            if (U.audioActive && U.beatConfidence > 0.5) {
+                hueShift = U.beatPhase * 30 + U.onset * 80;
+            } else if (U.audioActive) {
+                hueShift = U.spectralCentroid / 30 + U.beat * 150 + U.onset * 80;
+            } else {
+                hueShift = 0.8 + Math.random() * 3;
+            }
+            U.hue = (U.hue + hueShift) % 360;
+
+            // Clear with trail (stronger clear during form morphing for crisp shapes!)
+            const clearStrength = U.formSystem.formReady && U.formSystem.morphProgress < 0.6 ? 0.12 : 0.05;
+            const trailAlpha = U.beat > 0.3 ? 0.4 : clearStrength;
+            ctx.fillStyle = `rgba(0, 0, 0, ${trailAlpha})`;
+            ctx.fillRect(0, 0, W, H);
+
+            // 🌌 IMAGE IS INVISIBLE - particles dance & suggest shapes
+
+            // Random events
+            if (Math.random() < 0.004) {
+                const shockX = Math.random() * W, shockY = Math.random() * H;
+                agents.forEach(a => {
+                    const dx = a.x - shockX, dy = a.y - shockY;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist > 0 && dist < 500) {
+                        const force = (500 - dist) / 50;
+                        a.vx += (dx / dist) * force;
+                        a.vy += (dy / dist) * force;
+                    }
+                });
+            }
+
+            // Mitosis
+            if (U.mode === 'mitosis' && agents.length < 800 && Math.random() < 0.01) {
+                const parent = agents[Math.floor(Math.random() * agents.length)];
+                agents.push(new Agent(
+                    parent.x + (Math.random() - 0.5) * 20,
+                    parent.y + (Math.random() - 0.5) * 20,
+                    agents.length
+                ));
+            }
+
+            // Update agents
+            agents.forEach(a => {
+                a.modeForces();
+                a.attractorInfluence();
+                a.zoneInfluence();
+                a.formInfluence(); // 🎨 Form-based forces
+                a.update();
+            });
+
+            // Draw connections (DISABLED during form morphing for clarity!)
+            const showConnections = !U.formSystem.formReady || U.formSystem.morphProgress > 0.7;
+            if (showConnections) {
+                agents.forEach((a, i) => {
+                    if (i % 3 !== 0) return;
+                    agents.forEach((b, j) => {
+                        if (j <= i) return;
+                        const dx = b.x - a.x, dy = b.y - a.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist < 100) {
+                            const alpha = (1 - dist / 100) * 0.2;
+
+                            // 🧬 USE COLOR GENOME for connections
+                            const color = U.getColorFromGenome(dist, 0.6);
+                            ctx.strokeStyle = `hsla(${color.h}, ${color.s}%, ${color.l}%, ${alpha})`;
+                            ctx.lineWidth = 0.5;
+                            ctx.beginPath();
+                            ctx.moveTo(a.x, a.y);
+                            ctx.lineTo(b.x, b.y);
+                            ctx.stroke();
+                        }
+                    });
+                });
+            }
+
+            // Draw agents
+            agents.forEach(a => a.draw());
+
+            // 🎵 VISUAL BEAT INDICATOR: Pulsing ring synced to beat phase
+            if (U.beatPhase > 0 && U.beatConfidence > 0.5) {
+                const ringPhase = U.beatPhase; // 0-1
+                const ringSize = 30 + ringPhase * 80;
+                const ringAlpha = (1 - ringPhase) * 0.6;
+
+                ctx.strokeStyle = `hsla(${U.hue}, 100%, 60%, ${ringAlpha})`;
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.arc(CX, CY, ringSize, 0, Math.PI * 2);
+                ctx.stroke();
+
+                // Inner pulse on beat hit (phase near 0)
+                if (ringPhase < 0.15) {
+                    const hitAlpha = (0.15 - ringPhase) / 0.15;
+                    ctx.fillStyle = `hsla(${U.hue}, 100%, 70%, ${hitAlpha * 0.3})`;
+                    ctx.beginPath();
+                    ctx.arc(CX, CY, 40, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+
+            // Update & draw sparks
+            for (let i = sparks.length - 1; i >= 0; i--) {
+                if (!sparks[i].update()) {
+                    sparks.splice(i, 1);
+                } else {
+                    sparks[i].draw();
+                }
+            }
+
+            // POST-PROCESSING EFFECTS
+            fxCtx.clearRect(0, 0, W, H);
+
+            // 💥 CHROMATIC ABERRATION (GLITCH MODE!)
+            if (U.chromatic > 0.1 || U.beat > 0.3) {
+                const shift = Math.max(U.chromatic * 5, U.beat * 15); // BIGGER glitch on beats!
+                fxCtx.globalAlpha = 0.4;
+                fxCtx.globalCompositeOperation = 'screen';
+                fxCtx.drawImage(baseCanvas, -shift, 0);
+                fxCtx.drawImage(baseCanvas, shift, 0);
+
+                // Extra glitch: vertical offset on big beats
+                if (U.beat > 0.4) {
+                    fxCtx.drawImage(baseCanvas, 0, -shift * 0.5);
+                }
+
+                fxCtx.globalAlpha = 1;
+                fxCtx.globalCompositeOperation = 'source-over';
+            }
+
+            // Bloom
+            if (U.bloom > 0.1) {
+                fxCtx.globalAlpha = U.bloom * 0.5;
+                fxCtx.filter = `blur(${U.bloom * 10}px)`;
+                fxCtx.globalCompositeOperation = 'screen';
+                fxCtx.drawImage(baseCanvas, 0, 0);
+                fxCtx.filter = 'none';
+                fxCtx.globalAlpha = 1;
+                fxCtx.globalCompositeOperation = 'source-over';
+            }
+
+            // Update UI
+            document.getElementById('fps').textContent = U.fps;
+            document.getElementById('mode').textContent = U.mode.toUpperCase();
+            document.getElementById('audio').textContent = U.audioActive ? 'ON' : 'OFF';
+            document.getElementById('count').textContent = agents.length;
+            document.getElementById('bass').textContent = U.bass.toFixed(2);
+            document.getElementById('mid').textContent = U.mid.toFixed(2);
+            document.getElementById('high').textContent = U.high.toFixed(2);
+            document.getElementById('pitch').textContent = U.pitchConfidence > 0.01 ?
+                U.pitch.toFixed(0) + 'Hz' : '-';
+
+            // 🎵 SYNC ENGINE UI
+            document.getElementById('bpm').textContent = U.bpm > 0 ?
+                U.bpm.toFixed(0) + (U.beatConfidence > 0.7 ? '✓' : '?') : '-';
+            document.getElementById('phase').textContent = U.beatPhase > 0 ?
+                (U.beatPhase * 100).toFixed(0) + '%' : '-';
+            document.getElementById('latency').textContent = (U.latencyCompensation * 1000).toFixed(0);
+
+            // 🧬 COLOR GENOME UI
+            document.getElementById('colormode').textContent = U.colorGenome.harmonyMode.toUpperCase();
+
+            // 🎨 FORM SYSTEM UI
+            const formName = U.formSystem.currentForm || '-';
+            const formProgress = U.formSystem.formReady ? (U.formSystem.morphProgress * 100).toFixed(0) : 0;
+            document.getElementById('imagestate').textContent = U.formSystem.formReady ?
+                `${formName.toUpperCase()} ${formProgress}%` : 'INIT';
+
+            requestAnimationFrame(loop);
+        }
+
+        loop();
+
+        // AUDIO INIT
+        document.getElementById('audioBtn').addEventListener('click', async () => {
+            try {
+                let stream;
+                const choice = confirm('Capturer ONGLET avec audio?\n\nOUI = Onglet (YouTube/Spotify)\nNON = Microphone');
+
+                if (choice && navigator.mediaDevices.getDisplayMedia) {
+                    stream = await navigator.mediaDevices.getDisplayMedia({
+                        video: true,
+                        audio: {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false,
+                            sampleRate: 48000
+                        }
+                    });
+                } else {
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false,
+                            sampleRate: 48000
+                        }
+                    });
+                }
+
+                U.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                U.analyser = U.audioContext.createAnalyser();
+                U.analyser.fftSize = 512;
+                U.analyser.smoothingTimeConstant = 0;
+
+                const source = U.audioContext.createMediaStreamSource(stream);
+                source.connect(U.analyser);
+
+                U.bufferLength = U.analyser.frequencyBinCount;
+                U.dataArray = new Uint8Array(U.bufferLength);
+                U.audioActive = true;
+
+                document.getElementById('audioBtn').textContent = 'AUDIO ON ⚡';
+                document.getElementById('audioBtn').style.background = 'rgba(0,255,0,0.5)';
+
+            } catch (err) {
+                console.error('Audio error:', err);
+                alert('Erreur audio!\n\nAutorisez micro ou partagez onglet avec audio.');
+            }
+        });
+
+        // Mouse
+        baseCanvas.addEventListener('click', (e) => {
+            const force = 8;
+            agents.forEach(a => {
+                const dx = e.clientX - a.x, dy = e.clientY - a.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < 250 && dist > 0) {
+                    a.vx += (dx / dist) * force;
+                    a.vy += (dy / dist) * force;
+                }
+            });
+
+            for (let i = 0; i < 50; i++) {
+                sparks.push(new Spark(e.clientX, e.clientY));
+            }
+        });
+
+        // ⚡ LATENCY CALIBRATION: Arrow keys to adjust sync timing
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowUp') {
+                U.latencyCompensation += 0.005; // +5ms
+                console.log(`Latency: ${(U.latencyCompensation * 1000).toFixed(0)}ms`);
+            } else if (e.key === 'ArrowDown') {
+                U.latencyCompensation = Math.max(0, U.latencyCompensation - 0.005); // -5ms
+                console.log(`Latency: ${(U.latencyCompensation * 1000).toFixed(0)}ms`);
+            } else if (e.key === 'r' || e.key === 'R') {
+                // Reset to default
+                U.latencyCompensation = 0.035;
+                console.log('Latency reset to 35ms');
+            } else if (e.key === 'f' || e.key === 'F') {
+                // 🎨 Force new form
+                U.selectRandomForm();
+                console.log('🎨 Generating new form...');
+            } else if (e.key === 'm' || e.key === 'M') {
+                // 🧬 Force color mutation
+                const modes = ['mono', 'duo', 'triad', 'multi', 'bw'];
+                U.colorGenome.harmonyMode = modes[Math.floor(Math.random() * modes.length)];
+                console.log(`🧬 Color mode: ${U.colorGenome.harmonyMode}`);
+            }
+        });
+    </script>
+</body>
+</html>
